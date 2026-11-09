@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Daftar CLI — Telegram bridge + knowledge memory for Claude Code."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Allow running from a git checkout without installing
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+
+def _cmd_setup(_: argparse.Namespace) -> int:
+    from daftar.setup import run_setup
+
+    return run_setup()
+
+
+def _cmd_run(_: argparse.Namespace) -> int:
+    from daftar.bridge import run_bridge
+
+    run_bridge()
+    return 0
+
+
+def _cmd_doctor(_: argparse.Namespace) -> int:
+    from daftar.doctor import run_doctor
+
+    return run_doctor()
+
+
+def _cmd_send(args: argparse.Namespace) -> int:
+    from daftar.bridge import Bridge
+    from daftar.config import load_config
+
+    cfg = load_config()
+    bridge = Bridge(cfg)
+    path = Path(args.file).expanduser().resolve()
+    if not path.exists():
+        print(f"File not found: {path}", file=sys.stderr)
+        return 1
+    # Optional caption file next to dest in outbox, or use caption arg
+    outbox = bridge.workspace / "outbox"
+    outbox.mkdir(parents=True, exist_ok=True)
+    dest = outbox / path.name
+    if dest.resolve() != path:
+        import shutil
+
+        shutil.copy2(path, dest)
+    if args.caption:
+        (outbox / (path.name + ".txt")).write_text(args.caption, encoding="utf-8")
+    n = bridge.deliver_outbox(once_path=dest)
+    print(f"sent {n} file(s)")
+    return 0 if n else 1
+
+
+def _cmd_image(args: argparse.Namespace) -> int:
+    from daftar.config import apply_to_environ, load_config
+    from daftar.image import main as image_main
+
+    apply_to_environ(load_config())
+    argv = ["--prompt", args.prompt, "--out", args.out]
+    if args.size:
+        argv += ["--size", args.size]
+    for ref in args.ref or []:
+        argv += ["--ref", ref]
+    return image_main(argv)
+
+
+def _cmd_kb(args: argparse.Namespace) -> int:
+    from daftar.config import load_config, workspace_path
+    from daftar import kb as kbmod
+
+    ws = workspace_path(load_config()) if (load_config().get("WORKSPACE")) else None
+    # Prefer configured workspace; fall back to cwd
+    try:
+        cfg = load_config()
+        ws = workspace_path(cfg)
+    except Exception:
+        ws = None
+    return kbmod.main(args.kb_args, workspace=ws)
+
+
+def _cmd_curator(args: argparse.Namespace) -> int:
+    from daftar.config import apply_to_environ, load_config, workspace_path
+    from daftar.curator import run_curator
+
+    cfg = load_config()
+    apply_to_environ(cfg)
+    os.environ.setdefault("CURATOR_MODEL", cfg.get("CURATOR_MODEL") or "opus")
+    os.environ.setdefault(
+        "CURATOR_FULL_WEEKDAY", cfg.get("CURATOR_FULL_WEEKDAY") or "4"
+    )
+    return run_curator(
+        workspace=workspace_path(cfg),
+        dry_run=args.dry_run,
+        full=args.full,
+        topic=args.topic,
+        model=cfg.get("CURATOR_MODEL") or "opus",
+    )
+
+
+def _cmd_service(args: argparse.Namespace) -> int:
+    from daftar import service as svc
+
+    if args.service_cmd == "install":
+        return svc.install()
+    if args.service_cmd == "uninstall":
+        return svc.uninstall()
+    if args.service_cmd == "status":
+        return svc.status()
+    print("Usage: daftar service install|uninstall|status")
+    return 2
+
+
+def _cmd_version(_: argparse.Namespace) -> int:
+    from daftar import __version__
+
+    print(f"daftar {__version__}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="daftar",
+        description="Telegram bridge + long-term memory for Claude Code",
+    )
+    p.add_argument("--version", action="store_true", help="print version")
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("setup", help="interactive setup").set_defaults(func=_cmd_setup)
+    sub.add_parser("run", help="run the Telegram bridge").set_defaults(func=_cmd_run)
+    sub.add_parser("doctor", help="check install health").set_defaults(func=_cmd_doctor)
+
+    sp = sub.add_parser("send", help="send a file to the owner via Telegram")
+    sp.add_argument("file")
+    sp.add_argument("caption", nargs="?", default="")
+    sp.set_defaults(func=_cmd_send)
+
+    ip = sub.add_parser("image", help="generate an image via OpenAI")
+    ip.add_argument("--prompt", required=True)
+    ip.add_argument("--out", required=True)
+    ip.add_argument("--ref", action="append", default=[])
+    ip.add_argument("--size", default="1024x1024")
+    ip.set_defaults(func=_cmd_image)
+
+    kp = sub.add_parser("kb", help="knowledge base commands")
+    kp.add_argument("kb_args", nargs=argparse.REMAINDER)
+    kp.set_defaults(func=_cmd_kb)
+
+    cp = sub.add_parser("curator", help="run the knowledge curator")
+    cp.add_argument("--dry-run", action="store_true")
+    cp.add_argument("--full", action="store_true")
+    cp.add_argument("--topic", default=None)
+    cp.set_defaults(func=_cmd_curator)
+
+    sv = sub.add_parser("service", help="install/uninstall OS service")
+    sv.add_argument("service_cmd", nargs="?", default="status")
+    sv.set_defaults(func=_cmd_service)
+
+    sub.add_parser("version", help="print version").set_defaults(func=_cmd_version)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Allow `daftar --help` and `daftar --version`
+    if argv == ["--version"] or argv == ["-V"]:
+        return _cmd_version(argparse.Namespace())
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(argv)
+    if getattr(args, "version", False) and not args.command:
+        return _cmd_version(args)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    # Strip leading `--` from kb remainder if present
+    if args.command == "kb" and args.kb_args[:1] == ["--"]:
+        args.kb_args = args.kb_args[1:]
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

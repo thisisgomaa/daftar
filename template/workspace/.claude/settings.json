@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 REPLACE_WITH_ABSOLUTE_PATH_TO_kb_hook.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 REPLACE_WITH_ABSOLUTE_PATH_TO_kb_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

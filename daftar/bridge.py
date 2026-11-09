@@ -1,0 +1,517 @@
+"""Main Telegram ↔ Claude Code bridge loop."""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+from . import voice as voicemod
+from .config import apply_to_environ, get_int, load_config, logs_dir, workspace_path
+from .engine import ClaudeEngine
+from .scheduler import NightlyScheduler
+from .sessions import (
+    AppState,
+    consume_pending_seed,
+    list_for_ui,
+    load_state,
+    maybe_rotate_after_turn,
+    save_state,
+    start_fresh,
+    switch_session,
+    upsert_session,
+    write_handoff_paper,
+)
+from .telegram import Telegram, is_image_path
+
+log = logging.getLogger("daftar.bridge")
+
+# Optional caption for an outbox file: "<file name>.caption" next to it.
+CAPTION_SUFFIX = ".caption"
+
+COMMANDS = [
+    {"command": "new", "description": "Start a fresh session (with handoff)"},
+    {"command": "sessions", "description": "List / switch recent sessions"},
+    {"command": "model", "description": "Show or set model"},
+    {"command": "stop", "description": "Cancel the running turn"},
+    {"command": "ping", "description": "Health check"},
+    {"command": "help", "description": "Command help"},
+]
+
+HELP_TEXT = (
+    "Daftar commands:\n"
+    "/new — handoff paper + fresh session\n"
+    "/sessions — switch among the last 4 sessions\n"
+    "/model [name] — show or set model (sonnet/opus/haiku/default)\n"
+    "/stop — cancel the current turn\n"
+    "/ping — health check\n"
+    "/help — this message\n\n"
+    "Send text, photos, documents, or voice notes as usual."
+)
+
+
+class Bridge:
+    def __init__(self, cfg: Optional[dict[str, str]] = None) -> None:
+        self.cfg = cfg or load_config()
+        apply_to_environ(self.cfg)
+        token = (self.cfg.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN missing — run `daftar setup`")
+        owner = (self.cfg.get("OWNER_ID") or "").strip()
+        if not owner:
+            raise RuntimeError("OWNER_ID missing — run `daftar setup`")
+        self.owner_id = int(owner)
+        self.workspace = workspace_path(self.cfg)
+        self.tg = Telegram(
+            token,
+            api_base=self.cfg.get("TELEGRAM_API_BASE") or "https://api.telegram.org",
+        )
+        model = (self.cfg.get("MODEL") or "").strip()
+        self.state = load_state()
+        if self.state.model:
+            model = self.state.model
+        self.engine = ClaudeEngine(
+            cwd=self.workspace,
+            model=model,
+            permission_mode=self.cfg.get("PERMISSION_MODE") or "bypassPermissions",
+            timeout_sec=get_int(self.cfg, "TURN_TIMEOUT_SEC", 2700),
+            env={"ANTHROPIC_API_KEY": self.cfg.get("ANTHROPIC_API_KEY") or ""}
+            if self.cfg.get("ANTHROPIC_API_KEY")
+            else None,
+        )
+        self._turn_lock = threading.Lock()
+        self._running = False
+        self._pending: list[str] = []
+        self._pending_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._scheduler = NightlyScheduler(self)
+        self._outbox_thread: Optional[threading.Thread] = None
+
+    # ── lifecycle ─────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        for sub in ("inbox", "outbox", "outbox/sent", "sessions", "knowledge"):
+            (self.workspace / sub).mkdir(parents=True, exist_ok=True)
+        try:
+            self.tg.set_my_commands(COMMANDS)
+        except Exception:
+            log.warning("setMyCommands failed", exc_info=True)
+        self._outbox_thread = threading.Thread(
+            target=self._outbox_loop, name="daftar-outbox", daemon=True
+        )
+        self._outbox_thread.start()
+        self._scheduler.start()
+        log.info(
+            "bridge started owner=%s workspace=%s offset=%s",
+            self.owner_id,
+            self.workspace,
+            self.state.offset,
+        )
+        self._poll_loop()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.engine.cancel()
+        self._scheduler.stop()
+
+    # ── polling ───────────────────────────────────────────────────
+
+    def _poll_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                updates = self.tg.get_updates(
+                    self.state.offset or None, timeout=50
+                )
+            except Exception as e:
+                log.warning("getUpdates error: %s", e)
+                time.sleep(3)
+                continue
+            for upd in updates:
+                uid = int(upd.get("update_id", 0))
+                self.state.offset = uid + 1
+                save_state(self.state)
+                try:
+                    self._dispatch(upd)
+                except Exception:
+                    log.exception("dispatch failed update_id=%s", uid)
+
+    def _dispatch(self, upd: dict[str, Any]) -> None:
+        if "callback_query" in upd:
+            self._on_callback(upd["callback_query"])
+            return
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            return
+        from_user = msg.get("from") or {}
+        uid = int(from_user.get("id") or 0)
+        if uid != self.owner_id:
+            log.info("ignored non-owner uid=%s", uid)
+            return
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        if text.startswith("/"):
+            self._handle_command(msg, text)
+            return
+        pieces: list[str] = []
+        # media
+        if msg.get("photo"):
+            path = self._save_photo(msg)
+            if path:
+                pieces.append(f"[photo saved at {path}]")
+        if msg.get("document"):
+            path = self._save_document(msg)
+            if path:
+                pieces.append(f"[document saved at {path}]")
+        if msg.get("voice") or msg.get("audio"):
+            transcript = self._transcribe_voice(msg)
+            if transcript is None:
+                return  # already replied with error
+            pieces.append(transcript)
+        elif text:
+            pieces.append(text)
+        elif msg.get("caption"):
+            pieces.append(msg["caption"])
+        if not pieces:
+            return
+        self._enqueue_user_text("\n".join(pieces))
+
+    # ── commands ──────────────────────────────────────────────────
+
+    def _handle_command(self, msg: dict, text: str) -> None:
+        chat_id = int(msg["chat"]["id"])
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].split("@", 1)[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "/ping":
+            self.tg.send_message(chat_id, "pong")
+            return
+        if cmd == "/help":
+            self.tg.send_message(chat_id, HELP_TEXT)
+            return
+        if cmd == "/stop":
+            self.engine.cancel()
+            self.tg.send_message(chat_id, "Cancelled.")
+            return
+        if cmd == "/model":
+            if not arg:
+                cur = self.engine.model or "(CLI default)"
+                keyboard = {
+                    "inline_keyboard": [
+                        [
+                            {"text": "sonnet", "callback_data": "model:sonnet"},
+                            {"text": "opus", "callback_data": "model:opus"},
+                        ],
+                        [
+                            {"text": "haiku", "callback_data": "model:haiku"},
+                            {"text": "default", "callback_data": "model:"},
+                        ],
+                    ]
+                }
+                self.tg.send_message(
+                    chat_id, f"Current model: {cur}", reply_markup=keyboard
+                )
+                return
+            self._set_model(arg if arg != "default" else "")
+            self.tg.send_message(
+                chat_id, f"Model set to {self.engine.model or 'default'}."
+            )
+            return
+        if cmd == "/sessions":
+            self._send_sessions(chat_id)
+            return
+        if cmd == "/new":
+            self._cmd_new(chat_id)
+            return
+        # Unknown slash — treat as normal text
+        self._enqueue_user_text(text)
+
+    def _cmd_new(self, chat_id: int) -> None:
+        sid = self.state.current_session_id
+        if sid:
+            try:
+                path = write_handoff_paper(
+                    self.engine,
+                    sid,
+                    summary_model=self.cfg.get("SUMMARY_MODEL") or "sonnet",
+                    cfg=self.cfg,
+                )
+                upsert_session(self.state, sid, paper=str(path))
+            except Exception:
+                log.exception("handoff on /new failed")
+        start_fresh(self.state)
+        self.tg.send_message(chat_id, "Fresh session started.")
+
+    def _send_sessions(self, chat_id: int) -> None:
+        rows = list_for_ui(self.state)
+        if not rows:
+            self.tg.send_message(chat_id, "No sessions yet.")
+            return
+        keyboard = []
+        lines = ["Recent sessions:"]
+        for rec in rows:
+            mark = "•" if rec.id == self.state.current_session_id else "○"
+            title = rec.title or rec.id[:8]
+            lines.append(f"{mark} {title} (`{rec.id[:8]}`)")
+            keyboard.append(
+                [{"text": title[:40], "callback_data": f"session:{rec.id}"}]
+            )
+        self.tg.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    def _set_model(self, name: str) -> None:
+        self.engine.model = name
+        self.state.model = name
+        save_state(self.state)
+
+    def _on_callback(self, cbq: dict) -> None:
+        from_user = cbq.get("from") or {}
+        if int(from_user.get("id") or 0) != self.owner_id:
+            self.tg.answer_callback_query(cbq["id"], "Not authorized")
+            return
+        data = cbq.get("data") or ""
+        chat = (cbq.get("message") or {}).get("chat") or {}
+        chat_id = int(chat.get("id") or self.owner_id)
+        self.tg.answer_callback_query(cbq["id"])
+        if data.startswith("session:"):
+            sid = data.split(":", 1)[1]
+            if switch_session(self.state, sid):
+                self.tg.send_message(chat_id, f"Switched to session `{sid[:8]}`.")
+            else:
+                self.tg.send_message(chat_id, "Unknown session.")
+            return
+        if data.startswith("model:"):
+            name = data.split(":", 1)[1]
+            self._set_model(name)
+            self.tg.send_message(
+                chat_id, f"Model set to {self.engine.model or 'default'}."
+            )
+
+    # ── turn handling / interrupt ─────────────────────────────────
+
+    def _enqueue_user_text(self, text: str) -> None:
+        """Start a turn in the background, or interrupt the running one.
+
+        Turns run off the polling thread so new messages (and /stop) are seen
+        while Claude works; a message that arrives mid-turn cancels it and is
+        merged with any other pending messages into the next turn.
+        """
+        with self._pending_lock:
+            if self._running:
+                self._pending.append(text)
+                self.engine.cancel()
+                log.info("interrupt: queued message (%d pending)", len(self._pending))
+                return
+            self._running = True
+        threading.Thread(target=self._run_turn, args=(text,), name="daftar-turn", daemon=True).start()
+
+    def _run_turn(self, text: str) -> None:
+        with self._turn_lock:
+            self._running = True
+            try:
+                while True:
+                    self._execute_turn(text)
+                    # Drain messages that arrived mid-turn; flip _running under the
+                    # same lock so nothing slips in between "empty" and "idle".
+                    with self._pending_lock:
+                        if not self._pending:
+                            self._running = False
+                            return
+                        text = "\n\n".join(self._pending)
+                        self._pending.clear()
+            except Exception:
+                log.exception("turn failed")
+                with self._pending_lock:
+                    self._running = False
+                try:
+                    self.tg.send_message(self.owner_id, "Something went wrong running that turn. Check `daftar doctor` and the logs.")
+                except Exception:
+                    pass
+
+    def _reminder(self) -> str:
+        rem = (self.cfg.get("REMINDER") or "Reply in English. Be concise.").strip()
+        return f"⟨{rem}⟩"
+
+    def _execute_turn(self, user_text: str) -> None:
+        chat_id = self.owner_id
+        seed = consume_pending_seed(self.state)
+        prompt = user_text
+        if seed:
+            prompt = seed + "\n\n" + user_text
+
+        typing_stop = threading.Event()
+
+        def _typing() -> None:
+            while not typing_stop.wait(4.0):
+                self.tg.send_chat_action(chat_id, "typing")
+
+        t = threading.Thread(target=_typing, daemon=True)
+        self.tg.send_chat_action(chat_id, "typing")
+        t.start()
+        try:
+            result = self.engine.run(
+                prompt,
+                resume=self.state.current_session_id,
+                append_system_prompt=self._reminder(),
+            )
+        finally:
+            typing_stop.set()
+            t.join(timeout=1)
+
+        if result.cancelled and not result.text:
+            # Interrupted — pending messages will be drained by _run_turn
+            return
+
+        if result.session_id:
+            upsert_session(
+                self.state,
+                result.session_id,
+                user_text=user_text,
+                input_tokens=result.context_tokens,
+            )
+            self.state.current_session_id = result.session_id
+            save_state(self.state)
+
+        if result.is_error and result.error and not result.text:
+            self.tg.send_message(chat_id, result.error)
+            return
+
+        reply = (result.text or "").strip()
+        if not reply:
+            self.tg.send_message(
+                chat_id, "(No text in the reply — the turn finished empty.)"
+            )
+        else:
+            self.tg.send_html(chat_id, reply)
+
+        # Silent rotation after delivery
+        try:
+            maybe_rotate_after_turn(
+                self.state,
+                self.engine,
+                result,
+                rotate_tokens=get_int(self.cfg, "ROTATE_TOKENS", 120000),
+                summary_model=self.cfg.get("SUMMARY_MODEL") or "sonnet",
+                cfg=self.cfg,
+            )
+        except Exception:
+            log.exception("rotation failed")
+
+    # ── media helpers ─────────────────────────────────────────────
+
+    def _inbox(self) -> Path:
+        d = self.workspace / "inbox"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _save_photo(self, msg: dict) -> Optional[Path]:
+        photos = msg.get("photo") or []
+        if not photos:
+            return None
+        best = photos[-1]
+        dest = self._inbox() / f"photo_{best['file_id'][:16]}.jpg"
+        try:
+            self.tg.download_file(best["file_id"], dest)
+            return dest.resolve()
+        except Exception:
+            log.exception("photo download failed")
+            return None
+
+    def _save_document(self, msg: dict) -> Optional[Path]:
+        doc = msg.get("document") or {}
+        name = doc.get("file_name") or f"doc_{doc.get('file_id', 'x')[:16]}"
+        dest = self._inbox() / name
+        try:
+            self.tg.download_file(doc["file_id"], dest)
+            return dest.resolve()
+        except Exception:
+            log.exception("document download failed")
+            return None
+
+    def _transcribe_voice(self, msg: dict) -> Optional[str]:
+        media = msg.get("voice") or msg.get("audio") or {}
+        file_id = media.get("file_id")
+        if not file_id:
+            return None
+        ext = ".ogg" if msg.get("voice") else Path(media.get("file_name") or "audio.ogg").suffix
+        dest = self._inbox() / f"voice_{file_id[:16]}{ext}"
+        try:
+            self.tg.download_file(file_id, dest)
+        except Exception:
+            log.exception("voice download failed")
+            self.tg.send_message(self.owner_id, "Could not download the voice note.")
+            return None
+        text, reason = voicemod.transcribe(
+            dest, language=self.cfg.get("TRANSCRIBE_LANGUAGE") or ""
+        )
+        if not text:
+            self.tg.send_message(self.owner_id, voicemod.failure_message(reason))
+            return None
+        return text
+
+    # ── outbox ────────────────────────────────────────────────────
+
+    def _outbox_loop(self) -> None:
+        while not self._stop.wait(3.0):
+            try:
+                self.deliver_outbox()
+            except Exception:
+                log.exception("outbox loop error")
+
+    def deliver_outbox(self, once_path: Optional[Path] = None) -> int:
+        """Send files from outbox/ (or a single path). Returns count sent."""
+        outbox = self.workspace / "outbox"
+        sent_dir = outbox / "sent"
+        sent_dir.mkdir(parents=True, exist_ok=True)
+        if once_path is not None:
+            paths = [Path(once_path)]
+        else:
+            paths = sorted(
+                p
+                for p in outbox.iterdir()
+                if p.is_file() and not p.name.startswith(".") and not p.name.endswith(CAPTION_SUFFIX)
+            )
+        n = 0
+        for path in paths:
+            if not path.exists():
+                continue
+            cap_file = path.parent / (path.name + CAPTION_SUFFIX)
+            caption = cap_file.read_text(encoding="utf-8").strip()[:1024] if cap_file.exists() else ""
+            try:
+                if is_image_path(path):
+                    self.tg.send_photo(self.owner_id, path, caption=caption)
+                else:
+                    self.tg.send_document(self.owner_id, path, caption=caption)
+                dest = sent_dir / path.name
+                if dest.exists():
+                    dest = sent_dir / f"{int(time.time())}_{path.name}"
+                shutil.move(str(path), str(dest))
+                if cap_file.exists():
+                    cap_file.unlink(missing_ok=True)
+                n += 1
+            except Exception:
+                log.exception("outbox send failed for %s", path)
+        return n
+
+
+def run_bridge(cfg: Optional[dict[str, str]] = None) -> None:
+    logs_dir().mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler(logs_dir() / "bridge.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    bridge = Bridge(cfg)
+    try:
+        bridge.start()
+    except KeyboardInterrupt:
+        bridge.stop()

@@ -1,0 +1,62 @@
+{
+  "owner-communication": {
+    "title": "Owner communication",
+    "when": "Shaping replies to the owner: length, plans, approvals, file delivery",
+    "keywords": ["telegram", "reply", "approve", "plan", "go ahead", "don't send", "message me"],
+    "tools": ["daftar send"]
+  },
+  "writing-and-messages": {
+    "title": "Writing and messages",
+    "when": "Drafting emails, chats, posts, or any text that may leave the machine",
+    "keywords": ["email", "draft", "message", "write", "rewrite", "tone", "subject line"],
+    "tools": ["send_email", "gmail"]
+  },
+  "files-and-storage": {
+    "title": "Files and storage",
+    "when": "Organizing, moving, archiving, or syncing files and drives",
+    "keywords": ["file", "folder", "archive", "drive", "upload", "download", "rclone", "backup"],
+    "tools": ["rclone"]
+  },
+  "system-and-server": {
+    "title": "System and server",
+    "when": "Services, cron, restarts, tokens, backups, or destructive server ops",
+    "keywords": ["server", "systemctl", "cron", "restart", "service", "nginx", "docker", "ssh"],
+    "tools": ["systemctl", "crontab"]
+  },
+  "coding": {
+    "title": "Coding",
+    "when": "Writing, reviewing, or debugging code and repositories",
+    "keywords": ["code", "bug", "pr", "commit", "refactor", "test", "lint", "deploy"],
+    "tools": ["git", "pytest", "npm", "cargo"]
+  },
+  "research": {
+    "title": "Research",
+    "when": "Looking things up, comparing options, or summarizing sources",
+    "keywords": ["research", "compare", "sources", "documentation", "lookup", "investigate"],
+    "tools": ["WebSearch", "WebFetch"]
+  },
+  "images-and-media": {
+    "title": "Images and media",
+    "when": "Generating, editing, or reviewing images and media assets",
+    "keywords": ["image", "photo", "mockup", "generate image", "logo", "banner"],
+    "tools": ["daftar image"]
+  },
+  "scheduling-and-calendar": {
+    "title": "Scheduling and calendar",
+    "when": "Meetings, reminders, timelines, or calendar changes",
+    "keywords": ["calendar", "meeting", "schedule", "reminder", "deadline", "timezone"],
+    "tools": ["Google_Calendar"]
+  },
+  "people-and-contacts": {
+    "title": "People and contacts",
+    "when": "Working with names, roles, contact details, or relationship context",
+    "keywords": ["contact", "who is", "email address", "phone", "intro", "cc"],
+    "tools": []
+  },
+  "projects": {
+    "title": "Projects",
+    "when": "Client- or project-specific notes; search this file by project name",
+    "keywords": ["project", "client", "engagement"],
+    "tools": []
+  }
+}
