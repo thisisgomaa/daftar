@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 DEFAULTS: dict[str, str] = {
     "TELEGRAM_BOT_TOKEN": "",
@@ -14,6 +14,8 @@ DEFAULTS: dict[str, str] = {
     "LANGUAGE": "English",
     "TIMEZONE": "",
     "MODEL": "",
+    "ENGINE": "claude",
+    "PERSONA_FILE": "persona/PERSONA.md",
     "PERMISSION_MODE": "bypassPermissions",
     "ROTATE_TOKENS": "120000",
     "TURN_TIMEOUT_SEC": "2700",
@@ -30,34 +32,122 @@ DEFAULTS: dict[str, str] = {
     "ELEVENLABS_API_KEY": "",
     "ANTHROPIC_API_KEY": "",
     "ASSISTANT_NAME": "",
+    "BOT_USERNAME": "",
 }
 
 
-def daftar_home() -> Path:
-    """Return DAFTAR_HOME or ~/.daftar."""
+def daftar_root() -> Path:
+    """Top-level DAFTAR_HOME (~/.daftar), never a profile subdirectory."""
     override = os.environ.get("DAFTAR_HOME", "").strip()
     if override:
         return Path(override).expanduser().resolve()
     return Path.home() / ".daftar"
 
 
-def config_path() -> Path:
-    return daftar_home() / "config.env"
+def normalize_profile(name: Optional[str]) -> str:
+    """Return '' for the default (legacy) home; otherwise the profile name."""
+    n = (name or "").strip()
+    if not n or n == "default":
+        return ""
+    if any(ch in n for ch in "/\\") or n in (".", ".."):
+        raise ValueError(f"invalid profile name: {name!r}")
+    return n
 
 
-def state_path() -> Path:
-    return daftar_home() / "state.json"
+def active_profile() -> str:
+    """Currently selected profile ('' = default home)."""
+    return normalize_profile(os.environ.get("DAFTAR_PROFILE", ""))
 
 
-def logs_dir() -> Path:
-    return daftar_home() / "logs"
+def set_active_profile(name: Optional[str]) -> str:
+    """Set DAFTAR_PROFILE for this process. Returns normalized name ('' = default)."""
+    n = normalize_profile(name)
+    if n:
+        os.environ["DAFTAR_PROFILE"] = n
+    else:
+        os.environ.pop("DAFTAR_PROFILE", None)
+    return n
 
 
-def ensure_home() -> Path:
-    home = daftar_home()
+def profile_label(name: Optional[str] = None) -> str:
+    """Human-readable profile id ('default' or the name)."""
+    n = normalize_profile(name if name is not None else active_profile())
+    return n or "default"
+
+
+def profile_home(name: Optional[str] = None) -> Path:
+    """Config/state/logs directory for a profile (default = daftar_root)."""
+    n = normalize_profile(name if name is not None else active_profile())
+    root = daftar_root()
+    if n:
+        return root / "profiles" / n
+    return root
+
+
+def daftar_home() -> Path:
+    """Return the active profile home (DAFTAR_HOME or DAFTAR_HOME/profiles/NAME)."""
+    return profile_home()
+
+
+def config_path(name: Optional[str] = None) -> Path:
+    return profile_home(name) / "config.env"
+
+
+def state_path(name: Optional[str] = None) -> Path:
+    return profile_home(name) / "state.json"
+
+
+def logs_dir(name: Optional[str] = None) -> Path:
+    return profile_home(name) / "logs"
+
+
+def jobs_dir(name: Optional[str] = None) -> Path:
+    return profile_home(name) / "jobs"
+
+
+def ensure_home(name: Optional[str] = None) -> Path:
+    home = profile_home(name)
     home.mkdir(parents=True, exist_ok=True)
-    logs_dir().mkdir(parents=True, exist_ok=True)
+    (home / "logs").mkdir(parents=True, exist_ok=True)
     return home
+
+
+def list_profile_names() -> list[str]:
+    """Known profiles: 'default' if root config exists, plus profiles/* with config.env."""
+    names: list[str] = []
+    root = daftar_root()
+    if (root / "config.env").exists():
+        names.append("default")
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        for child in sorted(profiles.iterdir()):
+            if child.is_dir() and (child / "config.env").exists():
+                names.append(child.name)
+    return names
+
+
+def load_profile_config(name: str) -> dict[str, str]:
+    """Load one profile's config without changing the active profile."""
+    path = config_path(name)
+    cfg = dict(DEFAULTS)
+    cfg.update(parse_env_file(path))
+    if not cfg.get("WORKSPACE"):
+        cfg["WORKSPACE"] = str(Path.home() / "daftar-workspace")
+    return cfg
+
+
+def other_workspaces(exclude: Optional[str] = None) -> list[tuple[str, str]]:
+    """(profile_label, workspace) for profiles that have a WORKSPACE set."""
+    ex = profile_label(exclude if exclude is not None else active_profile())
+    out: list[tuple[str, str]] = []
+    for name in list_profile_names():
+        if name == ex:
+            continue
+        cfg = load_profile_config(name)
+        ws = (cfg.get("WORKSPACE") or "").strip()
+        if ws:
+            out.append((name, str(Path(ws).expanduser().resolve())))
+    return out
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -105,6 +195,10 @@ def load_config() -> dict[str, str]:
         cfg["REMINDER"] = f"Reply in {lang}. Be concise."
     if not cfg.get("TIMEZONE"):
         cfg["TIMEZONE"] = _detect_timezone()
+    if not (cfg.get("ENGINE") or "").strip():
+        cfg["ENGINE"] = "claude"
+    if not (cfg.get("PERSONA_FILE") or "").strip():
+        cfg["PERSONA_FILE"] = "persona/PERSONA.md"
     return cfg
 
 
@@ -165,6 +259,13 @@ def get_int(cfg: dict[str, str], key: str, default: int) -> int:
 def workspace_path(cfg: dict[str, str] | None = None) -> Path:
     c = cfg or load_config()
     return Path(c["WORKSPACE"]).expanduser().resolve()
+
+
+def persona_path(cfg: dict[str, str] | None = None, workspace: Path | None = None) -> Path:
+    c = cfg or load_config()
+    ws = workspace or workspace_path(c)
+    rel = (c.get("PERSONA_FILE") or "persona/PERSONA.md").strip()
+    return (ws / rel).resolve()
 
 
 def _quote(val: str) -> str:

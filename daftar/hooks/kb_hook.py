@@ -12,13 +12,23 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
 
-MAX_CHARS = 9000
-MAX_TOPICS = 2
+# Allow running as a script from a checkout
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from daftar.kb_match import (  # noqa: E402
+    MAX_CHARS,
+    MAX_TOPICS,
+    format_injection,
+    match_topics,
+    strip_reminder_brackets,
+    topic_bodies,
+)
 
 
 def _kb_root() -> Path:
@@ -51,10 +61,9 @@ def main() -> None:
     topics_path = kb / "topics.json"
     if not topics_path.exists():
         return
-    topics = json.loads(topics_path.read_text(encoding="utf-8"))
 
     if event == "UserPromptSubmit":
-        hay = re.sub(r"⟨[^⟩]*⟩", " ", data.get("prompt") or "").lower()
+        hay = strip_reminder_brackets(data.get("prompt") or "").lower()
         field = "keywords"
     elif event == "PostToolUse":
         tin = data.get("tool_input") or {}
@@ -66,33 +75,17 @@ def main() -> None:
     sf = _state_dir() / f"{sid}.json"
     seen = set(json.loads(sf.read_text())) if sf.exists() else set()
 
-    hits: list[str] = []
-    for slug, meta in topics.items():
-        if slug in seen:
-            continue
-        if any(k and str(k).lower() in hay for k in meta.get(field, []) or []):
-            hits.append(slug)
-    hits = hits[:MAX_TOPICS]
+    hits = match_topics(kb, hay, field, seen, max_topics=MAX_TOPICS)
     if not hits:
         return
 
-    parts: list[str] = []
-    for slug in hits:
-        p = kb / "topics" / f"{slug}.md"
-        if not p.exists():
-            continue
-        txt = p.read_text(encoding="utf-8")
-        if len(txt) > MAX_CHARS:
-            txt = txt[:MAX_CHARS] + f"\n… (rest of file: `daftar kb show {slug}`)"
-        parts.append(txt)
+    bodies = topic_bodies(kb, hits, max_chars=MAX_CHARS)
+    for slug, _ in bodies:
         seen.add(slug)
     sf.write_text(json.dumps(sorted(seen)))
-    if not parts:
+    if not bodies:
         return
-    ctx = (
-        "⟨Knowledge: this work touches the topic below — it was opened for you. Follow it.⟩\n\n"
-        + "\n\n".join(parts)
-    )
+    ctx = format_injection(bodies)
     print(
         json.dumps(
             {

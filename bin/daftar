@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daftar CLI — Telegram bridge + knowledge memory for Claude Code."""
+"""Daftar CLI — Telegram bridge + knowledge memory for Claude Code / Codex."""
 
 from __future__ import annotations
 
@@ -12,6 +12,34 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+def _apply_profile_from_argv(argv: list[str]) -> list[str]:
+    """Pull --profile NAME (or -p NAME) from argv; set DAFTAR_PROFILE."""
+    out: list[str] = []
+    i = 0
+    profile: str | None = None
+    while i < len(argv):
+        a = argv[i]
+        if a == "--profile" and i + 1 < len(argv):
+            profile = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--profile="):
+            profile = a.split("=", 1)[1]
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    if profile is not None:
+        from daftar.config import set_active_profile
+
+        set_active_profile(profile)
+    elif os.environ.get("DAFTAR_PROFILE"):
+        from daftar.config import set_active_profile
+
+        set_active_profile(os.environ.get("DAFTAR_PROFILE"))
+    return out
 
 
 def _cmd_setup(_: argparse.Namespace) -> int:
@@ -75,8 +103,6 @@ def _cmd_kb(args: argparse.Namespace) -> int:
     from daftar.config import load_config, workspace_path
     from daftar import kb as kbmod
 
-    ws = workspace_path(load_config()) if (load_config().get("WORKSPACE")) else None
-    # Prefer configured workspace; fall back to cwd
     try:
         cfg = load_config()
         ws = workspace_path(cfg)
@@ -124,17 +150,83 @@ def _cmd_version(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_profiles(_: argparse.Namespace) -> int:
+    from daftar.config import list_profile_names, load_profile_config
+    from daftar import service as svc
+
+    names = list_profile_names()
+    if not names:
+        print("(no profiles — run `daftar setup`)")
+        return 0
+    for name in names:
+        cfg = load_profile_config(name)
+        engine = cfg.get("ENGINE") or "claude"
+        bot = cfg.get("BOT_USERNAME") or "-"
+        ws = cfg.get("WORKSPACE") or "-"
+        st = svc.status_text(name)
+        print(f"{name:16} engine={engine:6} @{bot:24} service={st:12} ws={ws}")
+    return 0
+
+
+def _cmd_delegate(args: argparse.Namespace) -> int:
+    from daftar.config import active_profile, profile_label
+    from daftar import jobs as jobsmod
+
+    brief = args.brief or ""
+    if args.brief_file:
+        brief = Path(args.brief_file).expanduser().read_text(encoding="utf-8")
+    if not brief.strip():
+        print("Provide --brief or --brief-file", file=sys.stderr)
+        return 2
+    attachments = [str(Path(a).expanduser().resolve()) for a in (args.attach or [])]
+    for a in attachments:
+        if not Path(a).exists():
+            print(f"Attachment not found: {a}", file=sys.stderr)
+            return 1
+    job_id = jobsmod.enqueue(
+        args.to,
+        title=args.title,
+        brief=brief,
+        requester=profile_label(active_profile()),
+        attachments=attachments,
+    )
+    print(job_id)
+    print(
+        "Queued. Do not wait or poll: end your turn now with one line to the owner. "
+        "The result will come back to you as a [system] message, and you deliver it then.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_jobs(args: argparse.Namespace) -> int:
+    from daftar.config import set_active_profile
+    from daftar import jobs as jobsmod
+
+    if args.profile:
+        set_active_profile(args.profile)
+    rows = jobsmod.list_jobs(args.profile)
+    print(jobsmod.format_jobs_table(rows))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="daftar",
-        description="Telegram bridge + long-term memory for Claude Code",
+        description="Telegram bridge + long-term memory for Claude Code / Codex",
     )
     p.add_argument("--version", action="store_true", help="print version")
+    p.add_argument(
+        "--profile",
+        default=None,
+        help="use named profile (config/state under DAFTAR_HOME/profiles/NAME)",
+    )
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("setup", help="interactive setup").set_defaults(func=_cmd_setup)
     sub.add_parser("run", help="run the Telegram bridge").set_defaults(func=_cmd_run)
     sub.add_parser("doctor", help="check install health").set_defaults(func=_cmd_doctor)
+    sub.add_parser("profiles", help="list bridges/profiles").set_defaults(func=_cmd_profiles)
 
     sp = sub.add_parser("send", help="send a file to the owner via Telegram")
     sp.add_argument("file")
@@ -162,20 +254,39 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("service_cmd", nargs="?", default="status")
     sv.set_defaults(func=_cmd_service)
 
+    dp = sub.add_parser("delegate", help="hand a job to another profile/bridge")
+    dp.add_argument("--to", required=True, help="target profile name")
+    dp.add_argument("--title", required=True)
+    dp.add_argument("--brief", default="")
+    dp.add_argument("--brief-file", default="")
+    dp.add_argument("--attach", action="append", default=[])
+    dp.set_defaults(func=_cmd_delegate)
+
+    jp = sub.add_parser("jobs", help="list queued/running/done jobs")
+    jp.add_argument("--profile", default=None, help="profile to inspect")
+    jp.set_defaults(func=_cmd_jobs)
+
     sub.add_parser("version", help="print version").set_defaults(func=_cmd_version)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
     # Allow `daftar --help` and `daftar --version`
-    if argv == ["--version"] or argv == ["-V"]:
+    if raw == ["--version"] or raw == ["-V"]:
         return _cmd_version(argparse.Namespace())
+    # Apply --profile before importing profile-sensitive modules in subcommands
+    raw = _apply_profile_from_argv(raw)
     parser = build_parser()
-    if not argv:
+    if not raw:
         parser.print_help()
         return 0
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw)
+    # argparse --profile on the parser may also be set if left in argv — already stripped
+    if getattr(args, "profile", None) and args.command not in ("jobs",):
+        from daftar.config import set_active_profile
+
+        set_active_profile(args.profile)
     if getattr(args, "version", False) and not args.command:
         return _cmd_version(args)
     if not getattr(args, "func", None):

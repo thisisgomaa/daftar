@@ -1,4 +1,4 @@
-"""Claude Code CLI subprocess engine (stream-json)."""
+"""Engine interface: Claude Code and Codex CLI subprocess runners."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +26,10 @@ AUTH_MARKERS = (
     "run claude and log in",
 )
 
+ENGINE_CLAUDE = "claude"
+ENGINE_CODEX = "codex"
+KNOWN_ENGINES = (ENGINE_CLAUDE, ENGINE_CODEX)
+
 
 @dataclass
 class EngineResult:
@@ -38,8 +43,9 @@ class EngineResult:
     total_cost_usd: float = 0.0
     cancelled: bool = False
     raw_events: list[dict[str, Any]] = field(default_factory=list)
-
     last_context_tokens: int = 0
+    images: list[Path] = field(default_factory=list)
+    engine: str = ENGINE_CLAUDE
 
     @property
     def context_tokens(self) -> int:
@@ -49,8 +55,73 @@ class EngineResult:
         return int(self.input_tokens) + int(self.cache_tokens)
 
 
-class ClaudeEngine:
+class BaseEngine(ABC):
+    """Common subprocess engine contract."""
+
+    name: str = "base"
+    model: str = ""
+
+    @abstractmethod
+    def run(
+        self,
+        prompt: str,
+        *,
+        resume: Optional[str] = None,
+        append_system_prompt: Optional[str] = None,
+        extra_args: Optional[list[str]] = None,
+    ) -> EngineResult:
+        ...
+
+    @abstractmethod
+    def cancel(self) -> None:
+        ...
+
+    def is_running(self) -> bool:
+        return False
+
+
+def repo_bin_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "bin"
+
+
+def prepend_repo_bin(env: dict[str, str]) -> dict[str, str]:
+    """Ensure the `daftar` CLI is on PATH for the agent subprocess."""
+    bin_dir = str(repo_bin_dir())
+    env = dict(env)
+    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """SIGTERM the process group, then SIGKILL if needed."""
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 5
+    while proc.poll() is None and time.time() < deadline:
+        time.sleep(0.1)
+    if proc.poll() is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+class ClaudeEngine(BaseEngine):
     """Run the unmodified `claude` binary as a subprocess."""
+
+    name = ENGINE_CLAUDE
 
     def __init__(
         self,
@@ -102,10 +173,7 @@ class ClaudeEngine:
         if extra_args:
             cmd.extend(extra_args)
 
-        env = os.environ.copy()
-        # Make the `daftar` CLI available to the agent (kb, send, image).
-        bin_dir = str(Path(__file__).resolve().parents[1] / "bin")
-        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        env = prepend_repo_bin(os.environ.copy())
         if self.env:
             env.update({k: v for k, v in self.env.items() if v})
 
@@ -124,13 +192,14 @@ class ClaudeEngine:
         except FileNotFoundError:
             return EngineResult(
                 is_error=True,
+                engine=self.name,
                 error=(
                     "Claude Code CLI (`claude`) was not found on PATH. "
                     "Install it: curl -fsSL https://claude.ai/install.sh | bash"
                 ),
             )
 
-        result = EngineResult()
+        result = EngineResult(engine=self.name)
         assistant_parts: list[str] = []
         stderr_chunks: list[str] = []
 
@@ -180,7 +249,6 @@ class ClaudeEngine:
 
         stderr_text = "".join(stderr_chunks)
         if output_format == "text" and not result.text:
-            # Full stdout may have been line-split; reconstruct from parts + any leftover
             result.text = "\n".join(assistant_parts).strip()
 
         if not result.text and assistant_parts:
@@ -242,27 +310,7 @@ class ClaudeEngine:
             proc = self._proc
         if not proc or proc.poll() is not None:
             return
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        # Escalate if needed
-        deadline = time.time() + 5
-        while proc.poll() is None and time.time() < deadline:
-            time.sleep(0.1)
-        if proc.poll() is None:
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        kill_process_group(proc)
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -342,3 +390,39 @@ class ClaudeEngine:
             if err and not result.error:
                 result.error = str(err)
             return
+
+
+def make_engine(
+    cfg: dict[str, str],
+    *,
+    workspace: Path | str | None = None,
+    model: str = "",
+    name: str = "",
+) -> BaseEngine:
+    """Factory: pick Claude or Codex from config ENGINE (default claude)."""
+    from .config import get_int, workspace_path
+
+    engine_name = (name or cfg.get("ENGINE") or ENGINE_CLAUDE).strip().lower()
+    ws = Path(workspace) if workspace else workspace_path(cfg)
+    timeout = get_int(cfg, "TURN_TIMEOUT_SEC", 2700)
+    perm = cfg.get("PERMISSION_MODE") or "bypassPermissions"
+    use_model = model if model else (cfg.get("MODEL") or "")
+    if engine_name == ENGINE_CODEX:
+        from .engine_codex import CodexEngine
+
+        return CodexEngine(
+            cwd=ws,
+            model=use_model,
+            permission_mode=perm,
+            timeout_sec=timeout,
+        )
+    env = None
+    if cfg.get("ANTHROPIC_API_KEY"):
+        env = {"ANTHROPIC_API_KEY": cfg["ANTHROPIC_API_KEY"]}
+    return ClaudeEngine(
+        cwd=ws,
+        model=use_model,
+        permission_mode=perm,
+        timeout_sec=timeout,
+        env=env,
+    )

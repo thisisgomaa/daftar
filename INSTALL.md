@@ -2,12 +2,31 @@
 
 ## Human quickstart
 
-1. Install [Claude Code](https://code.claude.com) and run `claude` once to log in.
+1. Install [Claude Code](https://code.claude.com) and/or the [Codex CLI](https://github.com/openai/codex), and sign in (`claude` once, and/or `codex login`).
 2. Run `curl -fsSL https://raw.githubusercontent.com/thisisgomaa/daftar/main/install.sh | sh`, or clone this repo and run `./install.sh`.
 3. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`), paste the token into setup.
 4. Message the bot; enter the 6-digit pairing code shown in the terminal.
 5. Start the bridge: `daftar run` or `daftar service install`.
 6. Send `/ping` — you should get `pong`.
+
+### Add a second bridge (shared memory)
+
+To run Claude and Codex side by side (one bot each, one workspace):
+
+```bash
+# after the first bridge is set up:
+daftar --profile codex setup
+```
+
+Setup asks for the engine (`codex`), a **new** BotFather token, pairing, and whether to share memory with the existing profile. Persona is written to `persona/PERSONA.codex.md`. Then:
+
+```bash
+daftar --profile codex doctor
+daftar --profile codex service install   # unit: daftar-codex
+# or: daftar --profile codex run
+```
+
+List bridges: `daftar profiles`. Hand work across them: `daftar delegate --to codex --title "…" --brief "…"`.
 
 Windows: use WSL2, then follow the Linux steps inside the distro.
 
@@ -22,15 +41,16 @@ You are installing Daftar for your user. Follow these steps in order. Do not inv
 ```bash
 python3 -c 'import sys; assert sys.version_info >= (3,10), sys.version'
 command -v claude || echo 'MISSING_CLAUDE'
+command -v codex || echo 'MISSING_CODEX'
 ```
 
-If `claude` is missing, tell the human to install it:
+If `claude` is missing and they want a Claude bridge:
 
 ```bash
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Then have them run `claude` once interactively and complete login. Daftar never performs Claude login for them.
+Then have them run `claude` once interactively and complete login. For Codex: install the Codex CLI and run `codex login`. Daftar never performs login or stores credentials.
 
 ### 2. Install the app
 
@@ -56,21 +76,21 @@ Ensure `~/.local/bin` is on `PATH`.
 
 ### 3. `daftar setup` — what you will be asked
 
-Setup is interactive. Prefer keeping existing answers as defaults on re-runs.
+Setup is interactive. Prefer keeping existing answers as defaults on re-runs. Use `daftar --profile NAME setup` for additional bridges.
 
-1. **Claude check** — `claude --version`.
-2. **Telegram bot token** — human creates a bot via BotFather `/newbot` and pastes the token. Setup validates with `getMe`.
+1. **Engine** — detect `claude --version` / `codex --version`; choose `claude` or `codex` for this bridge. Mention `codex login` when relevant.
+2. **Telegram bot token** — human creates a bot via BotFather `/newbot` and pastes the token (one bot per bridge). Setup validates with `getMe`.
 3. **Pairing** — human sends any message to the bot. Setup shows the sender and sends a 6-digit code to that chat; human types the code in the terminal → `OWNER_ID` saved.
-4. **Workspace path** — default `~/daftar-workspace`. Template files are copied if empty; Claude Code hooks are rewritten with absolute paths.
+4. **Workspace path** — default `~/daftar-workspace`. If another profile already has a workspace, offer to reuse it ("share memory with …?"). Template files are copied if empty; Claude Code hooks are rewritten with absolute paths. Codex gets `AGENTS.md`.
 5. **Language** (default English), **timezone** (detected), **model** (blank = CLI default).
 6. **Permission mode** — explain clearly:
-   - `bypassPermissions`: full autonomy; **recommended only on a machine dedicated to this assistant**.
-   - `acceptEdits` / `default`: safer on shared machines.
-7. **Persona** — assistant name, who the owner is, tone, always/never → writes `persona/PERSONA.md` and `rules/MY_RULES.md`.
+   - `bypassPermissions`: full autonomy; **recommended only on a machine dedicated to this assistant** (Codex: `--dangerously-bypass-approvals-and-sandbox`).
+   - `acceptEdits` / `default` / non-bypass: safer on shared machines (Codex: `-s workspace-write`).
+7. **Persona** — assistant name, who the owner is, tone, always/never → writes `persona/PERSONA.md`, or `persona/PERSONA.<profile>.md` when the workspace is shared, plus `rules/MY_RULES.md`.
 8. **Optional keys** — `OPENAI_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, `ANTHROPIC_API_KEY` (all optional; explain voice / images / API-key mode).
-9. **Service** — offer `daftar service install`.
+9. **Service** — offer `daftar service install` (named profiles → `daftar-<profile>`).
 
-Config lands in `~/.daftar/config.env` with mode `600`. No secrets in the git repo.
+Config lands in `~/.daftar/config.env` (or `~/.daftar/profiles/<name>/config.env`) with mode `600`. No secrets in the git repo.
 
 ### 4. BotFather (human)
 

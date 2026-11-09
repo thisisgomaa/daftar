@@ -1,14 +1,14 @@
 # Daftar
 
-**Claude Code on Telegram, with a memory that stays small.**
+**Claude Code or Codex on Telegram, with a memory that stays small.**
 
-Daftar (Arabic for *notebook*) turns the official Claude Code CLI into a personal assistant you talk to from Telegram. It runs on your own VPS, Mac, or Linux box, and gives the assistant a long-term memory that stays organised by itself instead of growing until it drowns the context.
+Daftar (Arabic for *notebook*) turns the official Claude Code CLI — or OpenAI's Codex CLI — into a personal assistant you talk to from Telegram. It runs on your own VPS, Mac, or Linux box, and gives the assistant a long-term memory that stays organised by itself instead of growing until it drowns the context.
 
 ```
 curl -fsSL https://raw.githubusercontent.com/thisisgomaa/daftar/main/install.sh | sh
 ```
 
-Then `daftar setup` walks you through the bot token, pairing, and your assistant's persona.
+Then `daftar setup` walks you through the engine, bot token, pairing, and your assistant's persona.
 
 ---
 
@@ -22,23 +22,37 @@ Daftar treats memory like a well-kept notebook:
 |---|---|
 | **Map** | A few KB, always in context: how memory works, a handful of core rules, and one index line per topic. |
 | **Topics** | One file per topic (writing, server, images, projects…). Opened only when the work touches that topic. |
-| **Auto-open** | A Claude Code hook watches your message and the tools being used, and injects the right topic once per session. |
+| **Auto-open** | A Claude Code hook (or Codex prompt injection) watches your message and injects the right topic once per session. |
 | **One write path** | `daftar kb add <topic> "one line"` saves a lesson, refuses near-duplicates, and updates the map. |
 | **Nightly curator** | At 2 AM it merges duplicates, retires outdated lines with a reason, and protects the owner's own decisions. Nothing is ever deleted. |
 
 Same knowledge, about 70% less to read at the start of every session.
 
+## Run it on Claude Code, Codex, or both
+
+Each bridge is one engine, chosen at setup (`ENGINE=claude` or `ENGINE=codex`). You can run **two bots that share one workspace** — for example Claude for chat and Codex for images — so they share the knowledge base while keeping separate persona files, Telegram bots, and session state.
+
+- `daftar setup` — first bridge (default home `~/.daftar/`)
+- `daftar --profile codex setup` — second bridge under `~/.daftar/profiles/codex/`
+- Setup offers to reuse an existing workspace ("share memory with …?")
+- Shared workspaces write `persona/PERSONA.<profile>.md` so each bot keeps its own name and voice
+- Hand work across bridges with `daftar delegate`; the requester's bridge delivers the result to you
+
+Codex reads `AGENTS.md` (regenerated from rules + persona + MAP). Claude Code keeps using `CLAUDE.md` with `@imports`.
+
 ## Features
 
 - **Telegram bridge**: owner-only bot with pairing; text, photos, documents and voice notes
+- **Engines**: Claude Code or Codex CLI (one engine per bridge)
+- **Profiles**: several bridges, one optional shared memory
+- **Delegation**: hand a job to another bridge; result comes back for delivery
 - **Voice notes**: transcribed with OpenAI, Groq or ElevenLabs, whichever key you have
 - **Interrupt**: send a new message while it works and the running turn is cancelled; pending messages are merged into one turn
 - **No lost messages**: anything sent while the machine was off is processed when it comes back
 - **Long sessions roll over**: when the context grows past a threshold, the assistant writes a handoff paper (goal, decisions, open items, files, next step) and a fresh session continues from it
 - **Chat switching**: `/sessions` lists your last four chats with buttons; `/new` starts fresh with a handoff
 - **Files out**: `daftar send <file>` or drop a file into `workspace/outbox/` (optional caption in `<file>.caption`)
-- **Images**: `daftar image --prompt "…"` (OpenAI Images, optional)
-- **Delegation**: the assistant uses Claude Code's built-in sub-agents for heavy parallel work
+- **Images**: Codex built-in image tool (auto-delivered) or `daftar image --prompt "…"` (OpenAI Images)
 - **Background service**: systemd on Linux, launchd on macOS; Windows through WSL
 - **Python standard library only**: no pip dependencies
 
@@ -50,15 +64,21 @@ Anthropic's [terms](https://code.claude.com/docs/en/legal-and-compliance) say co
 
 Daftar is not affiliated with or endorsed by Anthropic.
 
+## How it runs Codex
+
+Codex bridges run the official `codex` CLI with your own login. Run `codex login` on the machine (ChatGPT account or API key). **Daftar never touches Codex credentials.** On auth errors the bridge replies: `Codex is not logged in. Run \`codex login\` on this machine.`
+
+Daftar is not affiliated with or endorsed by OpenAI.
+
 ## Daftar or the official Telegram channel?
 
 Anthropic ships an official [Telegram channel for Claude Code](https://code.claude.com/docs/en/channels) (research preview). It is first-party and simpler: if you only want to chat with a running session, use it.
 
-Daftar is for people who also want the memory system, voice notes, offline catch-up, interrupt, session rollover with handoff papers, chat switching, and a nightly curator.
+Daftar is for people who also want the memory system, voice notes, offline catch-up, interrupt, session rollover with handoff papers, chat switching, multi-engine profiles, and a nightly curator.
 
 ## Install
 
-**Prerequisites:** Python 3.10+, [Claude Code](https://code.claude.com) installed and signed in (run `claude` once), and a Telegram bot token from [@BotFather](https://t.me/BotFather).
+**Prerequisites:** Python 3.10+, [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex) installed and signed in, and a Telegram bot token from [@BotFather](https://t.me/BotFather) (one bot per bridge).
 
 ```bash
 # one-liner
@@ -68,7 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/thisisgomaa/daftar/main/install.sh 
 git clone https://github.com/thisisgomaa/daftar && cd daftar && ./install.sh
 ```
 
-Setup asks for: the bot token, a pairing code (message your bot, type the code it sends back), workspace path, reply language, timezone, model, permission mode, a few persona questions, and optional keys for voice and images. Config lives in `~/.daftar/config.env` (mode 600).
+Setup asks for: the engine, the bot token, a pairing code, workspace path (with optional memory sharing), reply language, timezone, model, permission mode, a few persona questions, and optional keys for voice and images. Config lives in `~/.daftar/config.env` (mode 600), or under `~/.daftar/profiles/<name>/` for named profiles.
 
 Prefer to let Claude Code do it? Open Claude Code and say: *"Read INSTALL.md from github.com/thisisgomaa/daftar and set Daftar up for me."*
 
@@ -88,7 +108,10 @@ Send `/ping` to your bot.
 **On the machine:**
 
 ```bash
-daftar setup | run | doctor | version
+daftar [--profile NAME] setup | run | doctor | version
+daftar profiles
+daftar delegate --to <profile> --title "…" (--brief "…" | --brief-file F) [--attach PATH]...
+daftar jobs [--profile P]
 daftar kb add <topic> "lesson" [--by owner|assistant]
 daftar kb show <topic> | find "words" | topics | check | map
 daftar kb new-topic <slug> "Title" "when to open it"
@@ -98,31 +121,34 @@ daftar image --prompt "…" --out file.png [--ref image]
 daftar service install | uninstall | status
 ```
 
+`--profile NAME` (or env `DAFTAR_PROFILE`) puts config/state/logs in `DAFTAR_HOME/profiles/NAME/`. No flag keeps the existing default home.
+
 ## Workspace layout
 
 ```
 daftar-workspace/
-  CLAUDE.md              imports the files below
+  CLAUDE.md              imports the files below (Claude)
+  AGENTS.md              generated for Codex from the same sources
   rules/BASE_RULES.md    sensible defaults (plan before big work, confirm before irreversible steps, …)
   rules/MY_RULES.md      your own standing rules
-  persona/PERSONA.md     who the assistant is, written during setup
+  persona/PERSONA.md     who the assistant is (or PERSONA.<profile>.md when sharing)
   knowledge/MAP.md       generated index, always in context
   knowledge/core.md      the few rules that are never optional
   knowledge/topics/*.md  one file per topic
   knowledge/_archive/    everything the curator retired, with reasons
   sessions/              handoff papers
+  delegations/           cross-bridge job workspaces
   inbox/  outbox/        files in and out of Telegram
 ```
 
 ## Security
 
 - Only the paired Telegram account can talk to the bot; everyone else is ignored.
-- `bypassPermissions` lets the assistant run commands and edit files without asking. Use it only on a machine dedicated to the assistant. Claude Code refuses it as root unless `IS_SANDBOX=1` is set; a normal user account is the better choice.
-- Keys live in `~/.daftar/config.env` with mode 600 and are never written to the workspace.
+- `bypassPermissions` lets the assistant run commands and edit files without asking. Use it only on a machine dedicated to the assistant. Claude Code refuses it as root unless `IS_SANDBOX=1` is set; a normal user account is the better choice. On Codex this maps to `--dangerously-bypass-approvals-and-sandbox`.
+- Keys live in `~/.daftar/config.env` (or a profile's `config.env`) with mode 600 and are never written to the workspace.
 
 ## Roadmap
 
-- Other engines (Codex, OpenAI-compatible APIs)
 - Native Windows service
 - Smarter curator rules (ideas welcome: open an issue)
 

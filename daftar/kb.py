@@ -304,6 +304,15 @@ def main(argv: Optional[list[str]] = None, workspace: Optional[Path] = None) -> 
     if cmd == "map":
         with locked(kb):
             m = cmd_map(kb)
+        # Keep Codex AGENTS.md in sync when the workspace uses it
+        try:
+            ws = kb.parent
+            if (ws / "AGENTS.md").exists() or (ws / "rules" / "BASE_RULES.md").exists():
+                from .agents_md import ensure_agents_md
+
+                ensure_agents_md(ws, force=True)
+        except Exception:
+            pass
         print(f"map ok ({len(m.encode())} bytes)")
         return 0
     if cmd == "check":

@@ -13,14 +13,21 @@ need_python() {
   fi
 }
 
-need_claude() {
+need_engines() {
   if command -v claude >/dev/null 2>&1; then
-    return 0
+    :
+  else
+    echo "Claude Code CLI (\`claude\`) not found on PATH (needed for a Claude bridge)."
+    echo "Install it with:"
+    echo "  curl -fsSL https://claude.ai/install.sh | bash"
   fi
-  echo "Claude Code CLI (\`claude\`) not found on PATH."
-  echo "Install it with:"
-  echo "  curl -fsSL https://claude.ai/install.sh | bash"
-  echo "Then re-run this installer (or run: daftar setup)."
+  if command -v codex >/dev/null 2>&1; then
+    :
+  else
+    echo "Codex CLI (\`codex\`) not found on PATH (optional — for a Codex bridge)."
+    echo "Install Codex, then run: codex login"
+  fi
+  echo "Then run: daftar setup   (or: daftar --profile NAME setup)"
 }
 
 resolve_src() {
@@ -38,7 +45,7 @@ APP_DIR="$DAFTAR_HOME/app"
 BIN_DIR="${DAFTAR_BIN_DIR:-$HOME/.local/bin}"
 
 need_python
-need_claude || true
+need_engines || true
 
 mkdir -p "$DAFTAR_HOME" "$BIN_DIR" "$DAFTAR_HOME/logs"
 

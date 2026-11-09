@@ -1,4 +1,4 @@
-"""Main Telegram ↔ Claude Code bridge loop."""
+"""Main Telegram ↔ engine bridge loop."""
 
 from __future__ import annotations
 
@@ -9,12 +9,23 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from . import jobs as jobsmod
 from . import voice as voicemod
-from .config import apply_to_environ, get_int, load_config, logs_dir, workspace_path
-from .engine import ClaudeEngine
+from .agents_md import ensure_agents_md
+from .config import (
+    active_profile,
+    apply_to_environ,
+    get_int,
+    load_config,
+    logs_dir,
+    persona_path,
+    profile_label,
+    workspace_path,
+)
+from .engine import ENGINE_CODEX, make_engine
+from .kb_match import format_injection, match_topics, strip_reminder_brackets, topic_bodies
 from .scheduler import NightlyScheduler
 from .sessions import (
-    AppState,
     consume_pending_seed,
     list_for_ui,
     load_state,
@@ -65,6 +76,7 @@ class Bridge:
             raise RuntimeError("OWNER_ID missing — run `daftar setup`")
         self.owner_id = int(owner)
         self.workspace = workspace_path(self.cfg)
+        self.profile = profile_label()
         self.tg = Telegram(
             token,
             api_base=self.cfg.get("TELEGRAM_API_BASE") or "https://api.telegram.org",
@@ -73,15 +85,7 @@ class Bridge:
         self.state = load_state()
         if self.state.model:
             model = self.state.model
-        self.engine = ClaudeEngine(
-            cwd=self.workspace,
-            model=model,
-            permission_mode=self.cfg.get("PERMISSION_MODE") or "bypassPermissions",
-            timeout_sec=get_int(self.cfg, "TURN_TIMEOUT_SEC", 2700),
-            env={"ANTHROPIC_API_KEY": self.cfg.get("ANTHROPIC_API_KEY") or ""}
-            if self.cfg.get("ANTHROPIC_API_KEY")
-            else None,
-        )
+        self.engine = make_engine(self.cfg, workspace=self.workspace, model=model)
         self._turn_lock = threading.Lock()
         self._running = False
         self._pending: list[str] = []
@@ -89,13 +93,21 @@ class Bridge:
         self._stop = threading.Event()
         self._scheduler = NightlyScheduler(self)
         self._outbox_thread: Optional[threading.Thread] = None
+        self._jobs_thread: Optional[threading.Thread] = None
+
+    @property
+    def is_codex(self) -> bool:
+        return (self.cfg.get("ENGINE") or "").strip().lower() == ENGINE_CODEX or (
+            getattr(self.engine, "name", "") == ENGINE_CODEX
+        )
 
     # ── lifecycle ─────────────────────────────────────────────────
 
     def start(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)
-        for sub in ("inbox", "outbox", "outbox/sent", "sessions", "knowledge"):
+        for sub in ("inbox", "outbox", "outbox/sent", "sessions", "knowledge", "delegations"):
             (self.workspace / sub).mkdir(parents=True, exist_ok=True)
+        jobsmod.ensure_jobs_dirs(active_profile())
         try:
             self.tg.set_my_commands(COMMANDS)
         except Exception:
@@ -104,9 +116,15 @@ class Bridge:
             target=self._outbox_loop, name="daftar-outbox", daemon=True
         )
         self._outbox_thread.start()
+        self._jobs_thread = threading.Thread(
+            target=self._jobs_loop, name="daftar-jobs", daemon=True
+        )
+        self._jobs_thread.start()
         self._scheduler.start()
         log.info(
-            "bridge started owner=%s workspace=%s offset=%s",
+            "bridge started profile=%s engine=%s owner=%s workspace=%s offset=%s",
+            self.profile,
+            getattr(self.engine, "name", "?"),
             self.owner_id,
             self.workspace,
             self.state.offset,
@@ -243,6 +261,7 @@ class Bridge:
             except Exception:
                 log.exception("handoff on /new failed")
         start_fresh(self.state)
+        self._clear_kb_seen()
         self.tg.send_message(chat_id, "Fresh session started.")
 
     def _send_sessions(self, chat_id: int) -> None:
@@ -282,6 +301,7 @@ class Bridge:
         if data.startswith("session:"):
             sid = data.split(":", 1)[1]
             if switch_session(self.state, sid):
+                self._sync_kb_seen_session()
                 self.tg.send_message(chat_id, f"Switched to session `{sid[:8]}`.")
             else:
                 self.tg.send_message(chat_id, "Unknown session.")
@@ -299,7 +319,7 @@ class Bridge:
         """Start a turn in the background, or interrupt the running one.
 
         Turns run off the polling thread so new messages (and /stop) are seen
-        while Claude works; a message that arrives mid-turn cancels it and is
+        while the engine works; a message that arrives mid-turn cancels it and is
         merged with any other pending messages into the next turn.
         """
         with self._pending_lock:
@@ -338,12 +358,79 @@ class Bridge:
         rem = (self.cfg.get("REMINDER") or "Reply in English. Be concise.").strip()
         return f"⟨{rem}⟩"
 
-    def _execute_turn(self, user_text: str) -> None:
+    def _clear_kb_seen(self) -> None:
+        self.state.extra["kb_seen"] = []
+        self.state.extra["kb_seen_for"] = self.state.current_session_id
+        save_state(self.state)
+
+    def _sync_kb_seen_session(self) -> None:
+        sid = self.state.current_session_id
+        if self.state.extra.get("kb_seen_for") != sid:
+            self.state.extra["kb_seen"] = []
+            self.state.extra["kb_seen_for"] = sid
+            save_state(self.state)
+
+    def _codex_topic_prefix(self, user_text: str) -> str:
+        """Inject matched topic files once per session for Codex turns."""
+        self._sync_kb_seen_session()
+        seen = set(self.state.extra.get("kb_seen") or [])
+        kb = self.workspace / "knowledge"
+        hay = strip_reminder_brackets(user_text).lower()
+        hits = match_topics(kb, hay, "keywords", seen)
+        if not hits:
+            return ""
+        bodies = topic_bodies(kb, hits)
+        if not bodies:
+            return ""
+        for slug, _ in bodies:
+            seen.add(slug)
+        self.state.extra["kb_seen"] = sorted(seen)
+        self.state.extra["kb_seen_for"] = self.state.current_session_id
+        save_state(self.state)
+        return format_injection(bodies) + "\n\n"
+
+    def _prepare_codex_workspace(self) -> None:
+        ensure_agents_md(
+            self.workspace,
+            persona_file=persona_path(self.cfg, self.workspace),
+            cfg=self.cfg,
+        )
+        # Keep CLAUDE.md persona import pointed at this bridge's file when shared
+        self._sync_claude_persona_import()
+
+    def _sync_claude_persona_import(self) -> None:
+        rel = (self.cfg.get("PERSONA_FILE") or "persona/PERSONA.md").strip()
+        claude_md = self.workspace / "CLAUDE.md"
+        if not claude_md.exists():
+            return
+        try:
+            text = claude_md.read_text(encoding="utf-8")
+        except OSError:
+            return
+        import re
+
+        new = re.sub(
+            r"@persona/\S+",
+            f"@{rel}",
+            text,
+        )
+        if new != text:
+            claude_md.write_text(new, encoding="utf-8")
+
+    def _execute_turn(self, user_text: str, *, deliver: bool = True) -> None:
         chat_id = self.owner_id
         seed = consume_pending_seed(self.state)
         prompt = user_text
         if seed:
             prompt = seed + "\n\n" + user_text
+
+        if self.is_codex:
+            self._prepare_codex_workspace()
+            prefix = self._codex_topic_prefix(user_text)
+            if prefix:
+                prompt = prefix + prompt
+        else:
+            self._sync_claude_persona_import()
 
         typing_stop = threading.Event()
 
@@ -352,8 +439,9 @@ class Bridge:
                 self.tg.send_chat_action(chat_id, "typing")
 
         t = threading.Thread(target=_typing, daemon=True)
-        self.tg.send_chat_action(chat_id, "typing")
-        t.start()
+        if deliver:
+            self.tg.send_chat_action(chat_id, "typing")
+            t.start()
         try:
             result = self.engine.run(
                 prompt,
@@ -362,13 +450,15 @@ class Bridge:
             )
         finally:
             typing_stop.set()
-            t.join(timeout=1)
+            if deliver:
+                t.join(timeout=1)
 
         if result.cancelled and not result.text:
             # Interrupted — pending messages will be drained by _run_turn
             return
 
         if result.session_id:
+            prev = self.state.current_session_id
             upsert_session(
                 self.state,
                 result.session_id,
@@ -376,7 +466,13 @@ class Bridge:
                 input_tokens=result.context_tokens,
             )
             self.state.current_session_id = result.session_id
+            if prev != result.session_id and not prev:
+                # First sid of a fresh session — keep kb_seen accumulated this turn
+                self.state.extra["kb_seen_for"] = result.session_id
             save_state(self.state)
+
+        if not deliver:
+            return
 
         if result.is_error and result.error and not result.text:
             self.tg.send_message(chat_id, result.error)
@@ -390,9 +486,17 @@ class Bridge:
         else:
             self.tg.send_html(chat_id, reply)
 
+        # Codex built-in image tool → send new files as photos
+        for img in result.images or []:
+            try:
+                if Path(img).is_file():
+                    self.tg.send_photo(chat_id, Path(img))
+            except Exception:
+                log.exception("send codex image failed: %s", img)
+
         # Silent rotation after delivery
         try:
-            maybe_rotate_after_turn(
+            rotated = maybe_rotate_after_turn(
                 self.state,
                 self.engine,
                 result,
@@ -400,8 +504,78 @@ class Bridge:
                 summary_model=self.cfg.get("SUMMARY_MODEL") or "sonnet",
                 cfg=self.cfg,
             )
+            if rotated:
+                self._clear_kb_seen()
         except Exception:
             log.exception("rotation failed")
+
+    # ── jobs (delegation) ─────────────────────────────────────────
+
+    def _jobs_loop(self) -> None:
+        while not self._stop.wait(2.0):
+            try:
+                if not self._running:
+                    self._process_one_job()
+                self._poll_job_results()
+            except Exception:
+                log.exception("jobs loop error")
+
+    def _process_one_job(self) -> None:
+        with self._pending_lock:
+            if self._running:
+                return
+            self._running = True
+        try:
+            job = jobsmod.claim_next(active_profile())
+            if not job:
+                return
+            log.info("running delegated job %s", job.get("id", "")[:8])
+            try:
+                status, result_dir, summary = jobsmod.run_job_in_workspace(
+                    job,
+                    workspace=self.workspace,
+                    engine=self.engine,
+                )
+                jobsmod.finish_job(
+                    job,
+                    status=status,
+                    result_dir=result_dir,
+                    summary=summary if status == "ok" else "",
+                    error=summary if status == "failed" else "",
+                )
+            except Exception as e:
+                log.exception("job failed")
+                work = self.workspace / "delegations" / job["id"]
+                work.mkdir(parents=True, exist_ok=True)
+                jobsmod.finish_job(
+                    job,
+                    status="failed",
+                    result_dir=str(work),
+                    error=str(e)[:500],
+                )
+        finally:
+            with self._pending_lock:
+                self._running = False
+
+    def _poll_job_results(self) -> None:
+        pending = jobsmod.list_pending_results(active_profile())
+        for result in pending:
+            # Don't interleave with an owner turn
+            if self._running:
+                return
+            prompt = jobsmod.review_prompt(result)
+            log.info("reviewing delegated result %s", result.get("id", "")[:8])
+            with self._pending_lock:
+                if self._running:
+                    return
+                self._running = True
+            try:
+                with self._turn_lock:
+                    self._execute_turn(prompt, deliver=True)
+            finally:
+                with self._pending_lock:
+                    self._running = False
+            jobsmod.consume_result(active_profile(), result["id"])
 
     # ── media helpers ─────────────────────────────────────────────
 

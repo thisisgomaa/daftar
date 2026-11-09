@@ -14,8 +14,11 @@ from pathlib import Path
 from typing import Optional
 
 from .config import (
+    active_profile,
     ensure_home,
     load_config,
+    other_workspaces,
+    profile_label,
     save_config,
     _detect_timezone,
 )
@@ -95,20 +98,17 @@ def _rewrite_hook_settings(workspace: Path) -> None:
     settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
 
 
-def _check_claude() -> bool:
-    if not shutil.which("claude"):
-        print("✗ `claude` not found on PATH.")
-        print("  Install Claude Code: curl -fsSL https://claude.ai/install.sh | bash")
-        return False
+def _check_binary(name: str) -> tuple[bool, str]:
+    if not shutil.which(name):
+        return False, ""
     try:
         r = subprocess.run(
-            ["claude", "--version"], capture_output=True, text=True, timeout=30
+            [name, "--version"], capture_output=True, text=True, timeout=30
         )
-        print(f"✓ Claude Code: {(r.stdout or r.stderr or '').strip().splitlines()[0]}")
-        return True
+        ver = (r.stdout or r.stderr or "").strip().splitlines()
+        return True, (ver[0] if ver else "ok")
     except Exception as e:
-        print(f"✗ claude --version failed: {e}")
-        return False
+        return False, str(e)
 
 
 def _pair_owner(tg: Telegram, existing: str = "") -> str:
@@ -176,17 +176,44 @@ def _pair_owner(tg: Telegram, existing: str = "") -> str:
 
 
 def run_setup() -> int:
-    print("=== Daftar setup ===")
+    label = profile_label()
+    print(f"=== Daftar setup (profile: {label}) ===")
     ensure_home()
     cfg = load_config()
 
-    print("\n(1) Claude Code CLI")
-    if not _check_claude():
+    print("\n(1) Engine")
+    claude_ok, claude_ver = _check_binary("claude")
+    codex_ok, codex_ver = _check_binary("codex")
+    if claude_ok:
+        print(f"✓ Claude Code: {claude_ver}")
+    else:
+        print("✗ `claude` not found on PATH.")
+        print("  Install: curl -fsSL https://claude.ai/install.sh | bash")
+    if codex_ok:
+        print(f"✓ Codex CLI: {codex_ver}")
+    else:
+        print("✗ `codex` not found on PATH (optional — for a Codex bridge).")
+    print("  Codex auth: run `codex login` on this machine (ChatGPT account or API key).")
+    print("  Daftar never stores Codex/Claude credentials.")
+
+    default_engine = (cfg.get("ENGINE") or "claude").strip().lower()
+    if default_engine not in ("claude", "codex"):
+        default_engine = "claude"
+    engine = _prompt("Engine for this bridge (claude|codex)", default_engine).strip().lower()
+    if engine not in ("claude", "codex"):
+        print("Engine must be claude or codex.")
+        return 1
+    if engine == "claude" and not claude_ok:
         if not _yes("Continue without Claude on PATH?", default=False):
             return 1
+    if engine == "codex" and not codex_ok:
+        if not _yes("Continue without Codex on PATH?", default=False):
+            return 1
+    cfg["ENGINE"] = engine
 
     print("\n(2) Telegram bot token")
     print("  Talk to @BotFather → /newbot → copy the token.")
+    print("  Each bridge needs its own bot (one bot per engine/profile).")
     token = _prompt("Bot token", cfg.get("TELEGRAM_BOT_TOKEN", ""), secret=True)
     if not token:
         print("Token required.")
@@ -195,6 +222,7 @@ def run_setup() -> int:
     try:
         me = tg.get_me()
         print(f"✓ Bot @{me.get('username')} ({me.get('first_name')})")
+        cfg["BOT_USERNAME"] = str(me.get("username") or "")
     except Exception as e:
         print(f"✗ getMe failed: {e}")
         return 1
@@ -204,14 +232,33 @@ def run_setup() -> int:
     cfg["OWNER_ID"] = _pair_owner(tg, cfg.get("OWNER_ID", ""))
 
     print("\n(4) Workspace")
-    default_ws = cfg.get("WORKSPACE") or str(Path.home() / "daftar-workspace")
-    ws = Path(_prompt("Workspace path", default_ws)).expanduser()
-    cfg["WORKSPACE"] = str(ws.resolve())
+    shared = False
+    others = other_workspaces(label)
+    if others:
+        print("  Other profiles already have a workspace:")
+        for pname, pws in others:
+            print(f"    - {pname}: {pws}")
+        # Offer the first as default reuse target
+        reuse_name, reuse_ws = others[0]
+        if _yes(f"Share memory with {reuse_name}?", default=True):
+            ws = Path(reuse_ws)
+            shared = True
+            cfg["WORKSPACE"] = str(ws)
+            print(f"✓ Reusing workspace {ws}")
+        else:
+            default_ws = cfg.get("WORKSPACE") or str(Path.home() / "daftar-workspace")
+            ws = Path(_prompt("Workspace path", default_ws)).expanduser()
+            cfg["WORKSPACE"] = str(ws.resolve())
+    else:
+        default_ws = cfg.get("WORKSPACE") or str(Path.home() / "daftar-workspace")
+        ws = Path(_prompt("Workspace path", default_ws)).expanduser()
+        cfg["WORKSPACE"] = str(ws.resolve())
+
+    ws = Path(cfg["WORKSPACE"])
     if not any(ws.iterdir()) if ws.exists() else True:
         _copy_workspace(ws)
         print(f"✓ Template copied to {ws}")
     else:
-        # Ensure missing scaffolding
         _copy_workspace(ws)
         print(f"✓ Workspace ready at {ws}")
     _rewrite_hook_settings(ws)
@@ -219,14 +266,16 @@ def run_setup() -> int:
     print("\n(5) Language / timezone / model")
     cfg["LANGUAGE"] = _prompt("Reply language", cfg.get("LANGUAGE") or "English")
     cfg["TIMEZONE"] = _prompt("Timezone", cfg.get("TIMEZONE") or _detect_timezone())
+    model_hint = "CLI default"
     cfg["MODEL"] = _prompt(
-        "Model (blank = Claude Code default)", cfg.get("MODEL") or ""
+        f"Model (blank = {model_hint})", cfg.get("MODEL") or ""
     )
     cfg["REMINDER"] = f"Reply in {cfg['LANGUAGE']}. Be concise."
 
     print("\n(6) Permission mode")
     print("  bypassPermissions — full autonomy (ONLY on a machine dedicated to this assistant).")
-    print("  acceptEdits / default — safer; Claude Code may prompt for some actions.")
+    print("  For Codex this maps to --dangerously-bypass-approvals-and-sandbox;")
+    print("  otherwise Codex uses -s workspace-write.")
     print("  WARNING: bypassPermissions lets the agent edit and run commands without asking.")
     mode = _prompt(
         "Permission mode",
@@ -246,17 +295,39 @@ def run_setup() -> int:
     tone = _prompt("Tone (e.g. concise, warm, direct)", "concise and direct")
     always = _prompt("Anything to always do?", "")
     never = _prompt("Anything to never do?", "")
-    persona = ws / "persona" / "PERSONA.md"
+
+    # Shared workspace → PERSONA.<profile>.md so each bot keeps its own voice
+    if shared:
+        persona_rel = f"persona/PERSONA.{label}.md"
+    else:
+        persona_rel = "persona/PERSONA.md"
+    cfg["PERSONA_FILE"] = persona_rel
+    persona = ws / persona_rel
     persona.parent.mkdir(parents=True, exist_ok=True)
+    engine_label = "Codex" if engine == "codex" else "Claude Code"
     persona.write_text(
         f"# Persona\n\n"
-        f"You are **{name}**, a personal assistant running via Claude Code and Telegram.\n\n"
+        f"You are **{name}**, a personal assistant running via {engine_label} and Telegram.\n\n"
         f"## Owner\n{owner_desc or '(not specified)'}\n\n"
         f"## Tone\n{tone}\n\n"
         f"## Always\n{always or '- Be helpful and honest.'}\n\n"
         f"## Never\n{never or '- Never invent facts or credentials.'}\n",
         encoding="utf-8",
     )
+    # Point CLAUDE.md at this persona when not using the default path
+    claude_md = ws / "CLAUDE.md"
+    if claude_md.exists() and persona_rel != "persona/PERSONA.md":
+        text = claude_md.read_text(encoding="utf-8")
+        import re
+
+        claude_md.write_text(re.sub(r"@persona/\S+", f"@{persona_rel}", text), encoding="utf-8")
+
+    if engine == "codex":
+        from .agents_md import ensure_agents_md
+
+        ensure_agents_md(ws, persona_file=persona, cfg=cfg, force=True)
+        print(f"✓ Wrote AGENTS.md for Codex (persona {persona_rel})")
+
     rules = ws / "rules" / "MY_RULES.md"
     rules.parent.mkdir(parents=True, exist_ok=True)
     if not rules.exists() or rules.stat().st_size == 0:
@@ -272,13 +343,13 @@ def run_setup() -> int:
     print("  GROQ — voice fallback (whisper-large-v3)")
     print("  ELEVENLABS — voice fallback (Scribe)")
     print("  ANTHROPIC — optional API-key mode (passed through to `claude` child env)")
-    for key, label in (
+    for key, label_key in (
         ("OPENAI_API_KEY", "OPENAI_API_KEY"),
         ("GROQ_API_KEY", "GROQ_API_KEY"),
         ("ELEVENLABS_API_KEY", "ELEVENLABS_API_KEY"),
         ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
     ):
-        cfg[key] = _prompt(label, cfg.get(key, ""), secret=True)
+        cfg[key] = _prompt(label_key, cfg.get(key, ""), secret=True)
 
     save_config(cfg)
     print(f"\n✓ Saved {ensure_home() / 'config.env'} (mode 600)")
@@ -289,9 +360,10 @@ def run_setup() -> int:
 
         svc.install()
     else:
-        print("  Later: `daftar service install` then `daftar run` (or let the service start).")
+        flag = f" --profile {label}" if active_profile() else ""
+        print(f"  Later: `daftar{flag} service install` then `daftar{flag} run`.")
 
-    print("\nDone. Next: `daftar run` (or start the service), then send /ping to the bot.")
+    print("\nDone. Next: start the bridge, then send /ping to the bot.")
     return 0
 
 

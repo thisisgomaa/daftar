@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import load_config, state_path, workspace_path
-from .engine import ClaudeEngine, EngineResult
+from .engine import BaseEngine, EngineResult
 
 log = logging.getLogger("daftar.sessions")
 
@@ -171,7 +171,7 @@ def list_for_ui(state: AppState) -> list[SessionRecord]:
 
 
 def write_handoff_paper(
-    engine: ClaudeEngine,
+    engine: BaseEngine,
     sid: str,
     *,
     summary_model: str = "sonnet",
@@ -206,7 +206,7 @@ def write_handoff_paper(
 
 def maybe_rotate_after_turn(
     state: AppState,
-    engine: ClaudeEngine,
+    engine: BaseEngine,
     result: EngineResult,
     *,
     rotate_tokens: int,
@@ -224,6 +224,14 @@ def maybe_rotate_after_turn(
     if not sid:
         return None
     ctx = result.context_tokens
+    # Codex compacts its own context, and its turn usage is summed over every
+    # model call, so size-based rotation would fire too early. Opt-in only.
+    if (
+        not force
+        and getattr(result, "engine", "") == "codex"
+        and (cfg or {}).get("ROTATE_CODEX", "no").lower() not in ("yes", "1", "true")
+    ):
+        return None
     if not force and ctx <= rotate_tokens:
         return None
 

@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import daftar_home, load_config
+from .config import active_profile, daftar_home, profile_label
 
 
 def _daftar_bin() -> Path:
@@ -25,21 +25,49 @@ def _daftar_bin() -> Path:
     return repo
 
 
+def service_unit_name(profile: str | None = None) -> str:
+    """systemd unit / launchd label suffix: daftar or daftar-<profile>."""
+    label = profile_label(profile if profile is not None else active_profile())
+    if label == "default":
+        return "daftar"
+    return f"daftar-{label}"
+
+
+def launchd_label(profile: str | None = None) -> str:
+    unit = service_unit_name(profile)
+    if unit == "daftar":
+        return "com.daftar.bridge"
+    return f"com.daftar.bridge.{profile_label(profile)}"
+
+
+def _profile_args() -> list[str]:
+    prof = active_profile()
+    if prof:
+        return ["--profile", prof]
+    return []
+
+
 def _linux_unit(user: bool) -> tuple[Path, str]:
+    from .config import daftar_root
+
     home = Path.home()
     bin_path = _daftar_bin()
     env_file = daftar_home() / "config.env"
+    unit = service_unit_name()
+    label = profile_label()
+    args = " ".join(_profile_args())
+    exec_start = f"{bin_path} {args} run".replace("  ", " ").strip()
     content = f"""[Unit]
-Description=Daftar Telegram bridge for Claude Code
+Description=Daftar Telegram bridge ({label})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={bin_path} run
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
-Environment=DAFTAR_HOME={daftar_home()}
+Environment=DAFTAR_HOME={daftar_root()}
 EnvironmentFile=-{env_file}
 WorkingDirectory={Path.home()}
 
@@ -47,32 +75,36 @@ WorkingDirectory={Path.home()}
 WantedBy={"default.target" if user else "multi-user.target"}
 """
     if user:
-        path = home / ".config" / "systemd" / "user" / "daftar.service"
+        path = home / ".config" / "systemd" / "user" / f"{unit}.service"
     else:
-        path = Path("/etc/systemd/system/daftar.service")
+        path = Path("/etc/systemd/system") / f"{unit}.service"
     return path, content
 
 
 def _macos_plist() -> tuple[Path, str]:
     bin_path = _daftar_bin()
     home = Path.home()
+    from .config import daftar_root
+
     logs = daftar_home() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    label = launchd_label()
+    prog_args = [str(bin_path), *_profile_args(), "run"]
+    args_xml = "\n".join(f"    <string>{a}</string>" for a in prog_args)
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.daftar.bridge</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{bin_path}</string>
-    <string>run</string>
+{args_xml}
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>DAFTAR_HOME</key>
-    <string>{daftar_home()}</string>
+    <string>{daftar_root()}</string>
     <key>PATH</key>
     <string>{os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}</string>
   </dict>
@@ -89,7 +121,7 @@ def _macos_plist() -> tuple[Path, str]:
 </dict>
 </plist>
 """
-    path = home / "Library" / "LaunchAgents" / "com.daftar.bridge.plist"
+    path = home / "Library" / "LaunchAgents" / f"{label}.plist"
     return path, content
 
 
@@ -112,14 +144,15 @@ def install() -> int:
         path, content = _linux_unit(user=user)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        unit = service_unit_name() + ".service"
         if user:
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            subprocess.run(["systemctl", "--user", "enable", "--now", "daftar.service"], check=False)
+            subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=False)
             print(f"Installed user unit: {path}")
             print("Tip: enable lingering so it survives logout: loginctl enable-linger $USER")
         else:
             subprocess.run(["systemctl", "daemon-reload"], check=False)
-            subprocess.run(["systemctl", "enable", "--now", "daftar.service"], check=False)
+            subprocess.run(["systemctl", "enable", "--now", unit], check=False)
             print(f"Installed system unit: {path}")
         return 0
 
@@ -130,7 +163,7 @@ def install() -> int:
 def uninstall() -> int:
     system = platform.system()
     if system == "Darwin":
-        path = Path.home() / "Library" / "LaunchAgents" / "com.daftar.bridge.plist"
+        path = Path.home() / "Library" / "LaunchAgents" / f"{launchd_label()}.plist"
         subprocess.run(["launchctl", "unload", str(path)], capture_output=True)
         if path.exists():
             path.unlink()
@@ -138,7 +171,7 @@ def uninstall() -> int:
         return 0
     if system == "Linux":
         user = os.geteuid() != 0
-        unit = "daftar.service"
+        unit = service_unit_name() + ".service"
         if user:
             subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=False)
             path = Path.home() / ".config" / "systemd" / "user" / unit
@@ -153,24 +186,47 @@ def uninstall() -> int:
     return 0
 
 
-def status() -> int:
+def status(profile: str | None = None) -> int:
     system = platform.system()
     if system == "Darwin":
+        label = launchd_label(profile)
         r = subprocess.run(
             ["launchctl", "list"],
             capture_output=True,
             text=True,
         )
-        found = "com.daftar.bridge" in (r.stdout or "")
-        print("LaunchAgent com.daftar.bridge:", "loaded" if found else "not loaded")
+        found = label in (r.stdout or "")
+        print(f"LaunchAgent {label}:", "loaded" if found else "not loaded")
         return 0 if found else 1
     if system == "Linux":
         user = os.geteuid() != 0
-        cmd = ["systemctl", "--user", "is-active", "daftar.service"] if user else [
-            "systemctl", "is-active", "daftar.service"
+        unit = service_unit_name(profile) + ".service"
+        cmd = ["systemctl", "--user", "is-active", unit] if user else [
+            "systemctl", "is-active", unit
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
         print((r.stdout or r.stderr or "").strip() or "unknown")
         return 0 if r.returncode == 0 else 1
     print("unknown")
     return 1
+
+
+def status_text(profile: str | None = None) -> str:
+    """Short status string for `daftar profiles`."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            label = launchd_label(profile)
+            r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+            return "loaded" if label in (r.stdout or "") else "not loaded"
+        if system == "Linux":
+            user = os.geteuid() != 0
+            unit = service_unit_name(profile) + ".service"
+            cmd = ["systemctl", "--user", "is-active", unit] if user else [
+                "systemctl", "is-active", unit
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            return (r.stdout or r.stderr or "unknown").strip() or "unknown"
+    except Exception:
+        return "unknown"
+    return "n/a"

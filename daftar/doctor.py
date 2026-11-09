@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import stat
 import subprocess
 import sys
-from pathlib import Path
 
 from . import kb as kbmod
 from . import service as svc
-from .config import config_path, load_config, workspace_path
+from .config import (
+    config_path,
+    load_config,
+    profile_label,
+    workspace_path,
+)
 from .telegram import Telegram
 
 
@@ -25,35 +28,53 @@ def _bad(msg: str, fix: str = "") -> None:
         print(f"  → {fix}")
 
 
+def _check_engine(engine: str) -> int:
+    bad = 0
+    engine = (engine or "claude").strip().lower()
+    if engine == "codex":
+        binary = "codex"
+        hint = "install Codex CLI, then run `codex login`"
+        login_hint = "Codex auth: run `codex login` (ChatGPT account or API key). Daftar never stores credentials."
+    else:
+        binary = "claude"
+        hint = "curl -fsSL https://claude.ai/install.sh | bash"
+        login_hint = "Claude auth: run `claude` once interactively and log in."
+
+    path = shutil.which(binary)
+    if path:
+        try:
+            r = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            ver = (
+                (r.stdout or r.stderr or "").strip().splitlines()[0]
+                if (r.stdout or r.stderr)
+                else "ok"
+            )
+            _ok(f"{binary} on PATH ({path}): {ver}")
+        except Exception as e:
+            _bad(f"{binary} found but --version failed: {e}")
+            bad += 1
+    else:
+        _bad(f"{binary} not on PATH", hint)
+        bad += 1
+    print(f"  {login_hint}")
+    return bad
+
+
 def run_doctor() -> int:
     bad = 0
+    label = profile_label()
+    print(f"— profile: {label} —")
+
     # Python
     if sys.version_info >= (3, 10):
         _ok(f"Python {sys.version.split()[0]}")
     else:
         _bad(f"Python {sys.version.split()[0]}", "Need Python >= 3.10")
-        bad += 1
-
-    # claude
-    claude = shutil.which("claude")
-    if claude:
-        try:
-            r = subprocess.run(
-                ["claude", "--version"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            ver = (r.stdout or r.stderr or "").strip().splitlines()[0] if (r.stdout or r.stderr) else "ok"
-            _ok(f"claude on PATH ({claude}): {ver}")
-        except Exception as e:
-            _bad(f"claude found but --version failed: {e}")
-            bad += 1
-    else:
-        _bad(
-            "claude not on PATH",
-            "curl -fsSL https://claude.ai/install.sh | bash",
-        )
         bad += 1
 
     # config
@@ -63,13 +84,17 @@ def run_doctor() -> int:
         if mode == 0o600:
             _ok(f"config {path} mode 600")
         else:
-            _bad(f"config {path} mode {oct(mode)}", "chmod 600 ~/.daftar/config.env")
+            _bad(f"config {path} mode {oct(mode)}", f"chmod 600 {path}")
             bad += 1
         cfg = load_config()
     else:
         _bad(f"config missing: {path}", "run: daftar setup")
         bad += 1
         return bad
+
+    engine = (cfg.get("ENGINE") or "claude").strip().lower()
+    _ok(f"ENGINE={engine}")
+    bad += _check_engine(engine)
 
     # Telegram
     token = (cfg.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -95,7 +120,6 @@ def run_doctor() -> int:
     # workspace
     ws = workspace_path(cfg)
     needed = [
-        "CLAUDE.md",
         "knowledge/topics.json",
         "knowledge/MAP.md",
         "knowledge/core.md",
@@ -103,12 +127,21 @@ def run_doctor() -> int:
         "outbox",
         "sessions",
     ]
+    if engine == "claude":
+        needed.insert(0, "CLAUDE.md")
     missing = [p for p in needed if not (ws / p).exists()]
     if missing:
         _bad(f"workspace incomplete ({ws}): missing {', '.join(missing)}", "re-run daftar setup")
         bad += 1
     else:
         _ok(f"workspace layout ok ({ws})")
+
+    persona = cfg.get("PERSONA_FILE") or "persona/PERSONA.md"
+    if (ws / persona).exists():
+        _ok(f"persona {persona}")
+    else:
+        _bad(f"persona missing: {persona}", "re-run daftar setup")
+        bad += 1
 
     # kb
     try:
