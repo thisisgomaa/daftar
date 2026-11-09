@@ -147,8 +147,8 @@ class Telegram:
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "timeout": timeout,
-            "allowed_updates": allowed_updates
-            or ["message", "callback_query", "edited_message"],
+            # No "edited_message": an edit must not re-run as a new turn.
+            "allowed_updates": allowed_updates or ["message", "callback_query"],
         }
         if offset is not None:
             params["offset"] = offset

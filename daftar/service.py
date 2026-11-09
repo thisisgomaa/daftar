@@ -11,6 +11,45 @@ from pathlib import Path
 
 from .config import active_profile, daftar_home, profile_label
 
+# PATH a systemd service gets when the unit sets none (systemd does not read the
+# login shell's PATH, and does not expand $PATH or ~ in Environment= lines).
+SYSTEMD_DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def service_path_value() -> str:
+    """Literal PATH for the systemd unit, so the service finds `claude` / `codex`.
+
+    Starts from the PATH at install time, prepends the directories holding
+    `claude`, `codex` and the running Python when they are missing, and appends
+    the systemd defaults. Only absolute directories are kept.
+    """
+    current: list[str] = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        d = os.path.expanduser(d.strip())
+        if d and os.path.isabs(d) and d not in current:
+            current.append(d)
+    extra: list[str] = []
+    for tool in ("claude", "codex"):
+        found = shutil.which(tool)
+        if found:
+            extra.append(str(Path(found).parent))
+    if sys.executable:
+        extra.append(str(Path(sys.executable).parent))
+    out: list[str] = []
+    for d in [x for x in extra if x not in current] + current + SYSTEMD_DEFAULT_PATH.split(":"):
+        if os.path.isabs(d) and d not in out:
+            out.append(d)
+    return ":".join(out)
+
+
+def _systemd_env_line(name: str, value: str) -> str:
+    """An ``Environment=`` line; quoted when needed, ``%`` escaped for systemd."""
+    value = value.replace("%", "%%")
+    if any(c in value for c in ' \t"\\'):
+        value = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'Environment="{name}={value}"'
+    return f"Environment={name}={value}"
+
 
 def _daftar_bin() -> Path:
     # Prefer the running script
@@ -68,6 +107,7 @@ ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
 Environment=DAFTAR_HOME={daftar_root()}
+{_systemd_env_line("PATH", service_path_value())}
 EnvironmentFile=-{env_file}
 WorkingDirectory={Path.home()}
 
@@ -145,14 +185,24 @@ def install() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         unit = service_unit_name() + ".service"
+        scope = ["--user"] if user else []
+        for step in (["daemon-reload"], ["enable", "--now", unit]):
+            cmd = ["systemctl", *scope, *step]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except OSError as e:
+                print(f"Wrote {path}, but `{' '.join(cmd)}` could not run: {e}")
+                return 1
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout or "").strip()
+                print(f"Wrote {path}, but `{' '.join(cmd)}` failed (exit {r.returncode}).")
+                if detail:
+                    print(detail)
+                return 1
         if user:
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=False)
             print(f"Installed user unit: {path}")
             print("Tip: enable lingering so it survives logout: loginctl enable-linger $USER")
         else:
-            subprocess.run(["systemctl", "daemon-reload"], check=False)
-            subprocess.run(["systemctl", "enable", "--now", unit], check=False)
             print(f"Installed system unit: {path}")
         return 0
 

@@ -84,6 +84,23 @@ def repo_bin_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "bin"
 
 
+def feed_stdin(proc: "subprocess.Popen[str]", data: str) -> None:
+    """Write ``data`` to the child's stdin, then close it (EOF ends the prompt)."""
+    stdin = proc.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(data)
+    except (BrokenPipeError, OSError, ValueError) as e:
+        # Child exited early or was cancelled; its exit status tells the story.
+        log.debug("stdin write stopped: %s", e)
+    finally:
+        try:
+            stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
 def prepend_repo_bin(env: dict[str, str]) -> dict[str, str]:
     """Ensure the `daftar` CLI is on PATH for the agent subprocess."""
     bin_dir = str(repo_bin_dir())
@@ -153,10 +170,11 @@ class ClaudeEngine(BaseEngine):
         output_format: str = "stream-json",
     ) -> EngineResult:
         self._cancelled = False
+        # The prompt goes through stdin, not argv: a positional starting with "-"
+        # is parsed as an option by the CLI, and Linux caps one argv element at 128 KiB.
         cmd = [
             self.binary,
             "-p",
-            prompt,
             "--output-format",
             output_format,
         ]
@@ -182,10 +200,12 @@ class ClaudeEngine(BaseEngine):
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=str(self.cwd),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
                 start_new_session=True,  # own process group
             )
@@ -210,6 +230,12 @@ class ClaudeEngine(BaseEngine):
 
         err_thread = threading.Thread(target=_read_stderr, daemon=True)
         err_thread.start()
+        # Feed the prompt from its own thread so a prompt larger than the pipe
+        # buffer can never deadlock against the stdout/stderr readers.
+        in_thread = threading.Thread(
+            target=feed_stdin, args=(self._proc, prompt), daemon=True
+        )
+        in_thread.start()
 
         deadline = time.time() + self.timeout_sec
         assert self._proc.stdout is not None

@@ -129,6 +129,49 @@ def sessions_dir(cfg: Optional[dict[str, str]] = None) -> Path:
     return d
 
 
+def transcripts_dir(cfg: Optional[dict[str, str]] = None, workspace: Optional[Path] = None) -> Path:
+    ws = Path(workspace) if workspace else workspace_path(cfg)
+    d = ws / "sessions" / "transcripts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def append_transcript(
+    workspace: Path,
+    *,
+    engine: str,
+    session_id: str,
+    user_text: str,
+    reply_text: str,
+    timezone_name: str = "UTC",
+    when: Optional[datetime] = None,
+) -> Path:
+    """Append one delivered turn to the day's transcript file (append-only)."""
+    from zoneinfo import ZoneInfo
+
+    eng = (engine or "claude").strip().lower() or "claude"
+    sid8 = (session_id or "unknown")[:8]
+    try:
+        tz = ZoneInfo(timezone_name) if timezone_name else ZoneInfo("UTC")
+    except Exception:
+        tz = ZoneInfo("UTC")
+    now = when or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    else:
+        now = now.astimezone(tz)
+    day = now.strftime("%Y-%m-%d")
+    hm = now.strftime("%H:%M")
+    path = transcripts_dir(workspace=workspace) / f"{day}_{eng}_{sid8}.md"
+    block = (
+        f"### {hm} owner\n{(user_text or '').rstrip()}\n\n"
+        f"### {hm} {eng}\n{(reply_text or '').rstrip()}\n\n"
+    )
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(block)
+    return path
+
+
 def upsert_session(
     state: AppState,
     sid: str,

@@ -39,7 +39,7 @@ You are installing Daftar for your user. Follow these steps in order. Do not inv
 ### 1. Prerequisites
 
 ```bash
-python3 -c 'import sys; assert sys.version_info >= (3,10), sys.version'
+python3 -c 'import sys; assert sys.version_info >= (3,9), sys.version'
 command -v claude || echo 'MISSING_CLAUDE'
 command -v codex || echo 'MISSING_CODEX'
 ```
@@ -61,7 +61,7 @@ chmod +x install.sh bin/daftar
 ./install.sh
 ```
 
-`install.sh` is idempotent: it checks Python ≥ 3.10, warns if `claude` is missing, copies/syncs the tree to `~/.daftar/app` when appropriate, symlinks `bin/daftar` into `~/.local/bin`, and runs `daftar setup`.
+`install.sh` is idempotent: it checks Python ≥ 3.9, warns if `claude` is missing, copies/syncs the tree to `~/.daftar/app` when appropriate, symlinks `bin/daftar` into `~/.local/bin`, and runs `daftar setup`.
 
 **Manual alternative** (if not using `install.sh`):
 
@@ -82,13 +82,16 @@ Setup is interactive. Prefer keeping existing answers as defaults on re-runs. Us
 2. **Telegram bot token** — human creates a bot via BotFather `/newbot` and pastes the token (one bot per bridge). Setup validates with `getMe`.
 3. **Pairing** — human sends any message to the bot. Setup shows the sender and sends a 6-digit code to that chat; human types the code in the terminal → `OWNER_ID` saved.
 4. **Workspace path** — default `~/daftar-workspace`. If another profile already has a workspace, offer to reuse it ("share memory with …?"). Template files are copied if empty; Claude Code hooks are rewritten with absolute paths. Codex gets `AGENTS.md`.
-5. **Language** (default English), **timezone** (detected), **model** (blank = CLI default).
+5. **Language** (default English), **timezone** (detected IANA name; the nightly job runs at `NIGHTLY_HOUR`, default 2 AM, in this zone), **model** (blank = CLI default).
 6. **Permission mode** — explain clearly:
    - `bypassPermissions`: full autonomy; **recommended only on a machine dedicated to this assistant** (Codex: `--dangerously-bypass-approvals-and-sandbox`).
    - `acceptEdits` / `default` / non-bypass: safer on shared machines (Codex: `-s workspace-write`).
+   - In every mode the paired Telegram account steers an agent running as this user; with bypass it runs any command without asking. In any mode it can read `config.env`. Tell the human; see Security in README.md.
 7. **Persona** — assistant name, who the owner is, tone, always/never → writes `persona/PERSONA.md`, or `persona/PERSONA.<profile>.md` when the workspace is shared, plus `rules/MY_RULES.md`.
 8. **Optional keys** — `OPENAI_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, `ANTHROPIC_API_KEY` (all optional; explain voice / images / API-key mode).
-9. **Service** — offer `daftar service install` (named profiles → `daftar-<profile>`).
+9. **Optional backup remote** — explain local `DAFTAR_HOME/backups/` archives; offer `BACKUP_RCLONE_REMOTE` (e.g. `gdrive:Daftar`) after `rclone config`. Leave blank to skip.
+10. **Connectors** — mention `daftar connect` / `docs/CONNECTORS.md` (MCP on Claude and Codex); OAuth may need one interactive `claude`/`codex` run.
+11. **Service** — offer `daftar service install` (named profiles → `daftar-<profile>`).
 
 Config lands in `~/.daftar/config.env` (or `~/.daftar/profiles/<name>/config.env`) with mode `600`. No secrets in the git repo.
 
@@ -118,8 +121,28 @@ In Telegram, send `/ping`. Expect `pong`. Then send a short text question; the r
 ```bash
 daftar kb check
 daftar kb topics
+daftar projects list
+daftar backup now
+daftar connect list
 daftar send /path/to/file.png "optional caption"
 daftar curator --dry-run
+```
+
+### Optional: backup remote
+
+1. Install [rclone](https://rclone.org/) and run `rclone config` (e.g. a Google Drive remote named `gdrive`).
+2. Set `BACKUP_RCLONE_REMOTE=gdrive:Daftar` in config (setup asks, or edit `config.env`).
+3. `daftar backup now` creates a local archive, verifies it, uploads with `rclone copyto`, verifies remote size/hash, then prunes old archives (local and remote) beyond `BACKUP_KEEP` (default 7).
+4. `config.env` is excluded from backups by default; set `BACKUP_INCLUDE_CONFIG=yes` only if you accept secrets in the archive.
+
+### Optional: connectors (MCP)
+
+See [docs/CONNECTORS.md](docs/CONNECTORS.md). Short version:
+
+```bash
+daftar connect add my-api --url https://example.com/mcp
+daftar connect add local --command "npx -y some-mcp-server"
+daftar connect list
 ```
 
 If voice notes fail, add a transcription key via re-running `daftar setup` or editing `~/.daftar/config.env`.

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import platform
 import shutil
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 from . import kb as kbmod
 from . import service as svc
@@ -26,6 +28,28 @@ def _bad(msg: str, fix: str = "") -> None:
     print(f"✗ {msg}")
     if fix:
         print(f"  → {fix}")
+
+
+def _info(msg: str) -> None:
+    print(f"! {msg}")
+
+
+def _check_service_path() -> None:
+    """Informational: engine CLIs outside the default systemd PATH (Linux)."""
+    if platform.system() != "Linux":
+        return
+    default_dirs = set(svc.SYSTEMD_DEFAULT_PATH.split(":"))
+    for binary in ("claude", "codex"):
+        found = shutil.which(binary)
+        if not found:
+            continue
+        d = str(Path(found).parent)
+        if d not in default_dirs:
+            _info(
+                f"{binary} is in {d}, outside the default systemd PATH; "
+                "the service unit carries PATH (re-run `daftar service install` "
+                "after moving it), so this is informational"
+            )
 
 
 def _check_engine(engine: str) -> int:
@@ -71,10 +95,10 @@ def run_doctor() -> int:
     print(f"— profile: {label} —")
 
     # Python
-    if sys.version_info >= (3, 10):
+    if sys.version_info >= (3, 9):
         _ok(f"Python {sys.version.split()[0]}")
     else:
-        _bad(f"Python {sys.version.split()[0]}", "Need Python >= 3.10")
+        _bad(f"Python {sys.version.split()[0]}", "Need Python >= 3.9")
         bad += 1
 
     # config
@@ -95,6 +119,7 @@ def run_doctor() -> int:
     engine = (cfg.get("ENGINE") or "claude").strip().lower()
     _ok(f"ENGINE={engine}")
     bad += _check_engine(engine)
+    _check_service_path()
 
     # Telegram
     token = (cfg.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -153,6 +178,35 @@ def run_doctor() -> int:
             bad += 1
     except Exception as e:
         _bad(f"kb check error: {e}")
+        bad += 1
+
+    # backups
+    try:
+        from . import backup as backupmod
+
+        info = backupmod.last_backup_info()
+        if not info.get("exists"):
+            _ok("backup: none yet (run `daftar backup now`)")
+        else:
+            age_h = float(info.get("age_hours") or 0)
+            age_s = f"{age_h:.1f}h ago" if age_h < 48 else f"{age_h / 24:.1f}d ago"
+            if info.get("verified"):
+                _ok(f"backup: {Path(info['path']).name} ({age_s}, verified)")
+            else:
+                _bad(
+                    f"backup: {Path(info['path']).name} ({age_s}) not verified",
+                    "daftar backup now",
+                )
+                bad += 1
+        remote = (cfg.get("BACKUP_RCLONE_REMOTE") or "").strip()
+        if remote:
+            if shutil.which("rclone"):
+                _ok(f"BACKUP_RCLONE_REMOTE={remote}")
+            else:
+                _bad("BACKUP_RCLONE_REMOTE set but rclone not on PATH", "install rclone")
+                bad += 1
+    except Exception as e:
+        _bad(f"backup check error: {e}")
         bad += 1
 
     # service

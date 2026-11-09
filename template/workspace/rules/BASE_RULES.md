@@ -57,6 +57,7 @@
 - Before work that touches a listed topic, open it: `daftar kb show <topic>` (or read `knowledge/topics/<slug>.md`).
 - Record new durable lessons immediately: `daftar kb add <topic> "one clear line" --by assistant`. Owner guidance uses `--by owner`.
 - Do not invent topics casually; use `daftar kb new-topic` when a real gap appears.
+- Connectors (MCP tools via the engine) are available; external writes through them still need the owner's approval and source verification.
 
 ## Delegation
 - Use `daftar delegate --to <profile> --title "…" --brief "…"` to hand work to another Daftar bridge (for example, image work to a Codex bridge). Tell the owner in one line that it was delegated and end the turn. Never wait for or poll the job: the result comes back to you as a [system] message, and that is when you review it and deliver it once.

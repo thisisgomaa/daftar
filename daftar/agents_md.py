@@ -14,6 +14,11 @@ HEADER = (
     "(rules/, persona/, knowledge/), not this file. -->\n"
 )
 
+PROJECTS_HINT = (
+    "Project status lives in projects/INDEX.md and projects/<slug>/STATUS.md. "
+    "Read them when the owner asks where something stands; don't ask them to re-explain.\n"
+)
+
 
 def _lock_path(workspace: Path) -> Path:
     return Path(workspace) / "knowledge" / ".agents_md.lock"
@@ -64,6 +69,9 @@ def build_agents_md(workspace: Path, persona_file: Path) -> str:
         parts.append(body)
         if not body.endswith("\n"):
             parts.append("\n")
+    parts.append("# Projects\n")
+    parts.append(PROJECTS_HINT)
+    parts.append("\n")
     # Projects index extras
     for extra in (
         Path(workspace) / "knowledge" / "projects_index.md",

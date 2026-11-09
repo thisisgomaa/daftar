@@ -84,7 +84,6 @@ def ask_model(
             [
                 binary,
                 "-p",
-                prompt,
                 "--model",
                 model,
                 "--no-session-persistence",
@@ -93,9 +92,13 @@ def ask_model(
                 "--allowedTools",
                 "",
             ],
-            stdin=subprocess.DEVNULL,
+            # Prompt via stdin (not argv): no "-"-prefix parsing, no 128 KiB argv cap.
+            # run(input=...) uses communicate(), so large prompts cannot deadlock.
+            input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=TIMEOUT,
             cwd="/tmp",
             check=False,
@@ -249,11 +252,13 @@ def run_curator(
     model: Optional[str] = None,
     runner: Optional[Callable[[str], str]] = None,
     notify: Optional[Callable[[str], None]] = None,
+    now: Optional[datetime] = None,
 ) -> int:
+    """``now`` (owner's local time) picks the full-run weekday; default: server clock."""
     kb = kbmod.knowledge_root(workspace)
     model = model or os.environ.get("CURATOR_MODEL") or "opus"
     full_weekday = int(os.environ.get("CURATOR_FULL_WEEKDAY", "4"))
-    do_full = full or datetime.now().weekday() == full_weekday
+    do_full = full or (now or datetime.now()).weekday() == full_weekday
     state = json.loads(_state_path(kb).read_text()) if _state_path(kb).exists() else {}
     last = state.get("last_run", "0000-00-00")
     topics = kbmod.load_topics(kb)

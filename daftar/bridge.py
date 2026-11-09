@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import threading
 import time
@@ -26,6 +27,7 @@ from .engine import ENGINE_CODEX, make_engine
 from .kb_match import format_injection, match_topics, strip_reminder_brackets, topic_bodies
 from .scheduler import NightlyScheduler
 from .sessions import (
+    append_transcript,
     consume_pending_seed,
     list_for_ui,
     load_state,
@@ -43,9 +45,63 @@ log = logging.getLogger("daftar.bridge")
 # Optional caption for an outbox file: "<file name>.caption" next to it.
 CAPTION_SUFFIX = ".caption"
 
+# Inbox file names come from Telegram (sender-controlled); keep them to a safe basename.
+_UNSAFE_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f/\\]")
+_SAFE_SUFFIX = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
+_MAX_NAME_LEN = 120
+
+
+def _safe_name(name: str, fallback: str) -> str:
+    """Reduce an untrusted file name to a plain basename safe to create in inbox/.
+
+    Drops any directory part (both / and \\), replaces NUL/control chars and
+    separators, strips leading dots/whitespace (no hidden or ``..`` names) and
+    truncates to ~120 chars while keeping a short extension. Returns
+    ``fallback`` when nothing usable is left.
+    """
+    raw = str(name or "").replace("\\", "/")
+    base = Path(raw).name
+    base = _UNSAFE_NAME_CHARS.sub("_", base)
+    base = base.strip().lstrip(". \t")
+    if len(base) > _MAX_NAME_LEN:
+        suffix = Path(base).suffix
+        if not _SAFE_SUFFIX.match(suffix):
+            suffix = ""
+        base = base[: _MAX_NAME_LEN - len(suffix)].rstrip() + suffix
+    if not base or base in (".", ".."):
+        return fallback
+    return base
+
+
+def _safe_suffix(name: str, default: str) -> str:
+    """Extension of ``name`` if it is short and alphanumeric, else ``default``."""
+    suffix = Path(_safe_name(name, "")).suffix
+    return suffix if _SAFE_SUFFIX.match(suffix) else default
+
+
+def _unique_dest(inbox: Path, name: str, tag: str = "") -> Path:
+    """``inbox/name``, or a non-existing variant (``stem-<tag>.ext`` / ``stem-N.ext``)."""
+    dest = inbox / name
+    if not dest.exists():
+        return dest
+    p = Path(name)
+    stem, suffix = (p.stem, p.suffix) if _SAFE_SUFFIX.match(p.suffix) else (name, "")
+    tag = re.sub(r"[^A-Za-z0-9_-]", "", tag or "")[:8]
+    if tag:
+        cand = inbox / f"{stem}-{tag}{suffix}"
+        if not cand.exists():
+            return cand
+    for i in range(2, 10_000):
+        cand = inbox / f"{stem}-{i}{suffix}"
+        if not cand.exists():
+            return cand
+    return inbox / f"{stem}-{int(time.time() * 1000)}{suffix}"
+
+
 COMMANDS = [
     {"command": "new", "description": "Start a fresh session (with handoff)"},
     {"command": "sessions", "description": "List / switch recent sessions"},
+    {"command": "projects", "description": "List project status index"},
     {"command": "model", "description": "Show or set model"},
     {"command": "stop", "description": "Cancel the running turn"},
     {"command": "ping", "description": "Health check"},
@@ -56,6 +112,7 @@ HELP_TEXT = (
     "Daftar commands:\n"
     "/new — handoff paper + fresh session\n"
     "/sessions — switch among the last 4 sessions\n"
+    "/projects — where projects stand (INDEX.md)\n"
     "/model [name] — show or set model (sonnet/opus/haiku/default)\n"
     "/stop — cancel the current turn\n"
     "/ping — health check\n"
@@ -105,7 +162,16 @@ class Bridge:
 
     def start(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)
-        for sub in ("inbox", "outbox", "outbox/sent", "sessions", "knowledge", "delegations"):
+        for sub in (
+            "inbox",
+            "outbox",
+            "outbox/sent",
+            "sessions",
+            "sessions/transcripts",
+            "projects",
+            "knowledge",
+            "delegations",
+        ):
             (self.workspace / sub).mkdir(parents=True, exist_ok=True)
         jobsmod.ensure_jobs_dirs(active_profile())
         try:
@@ -161,8 +227,11 @@ class Bridge:
         if "callback_query" in upd:
             self._on_callback(upd["callback_query"])
             return
-        msg = upd.get("message") or upd.get("edited_message")
+        msg = upd.get("message")
         if not msg:
+            # Edits of already-answered messages must not re-run as a new turn.
+            if "edited_message" in upd:
+                log.debug("ignored edited_message update_id=%s", upd.get("update_id"))
             return
         from_user = msg.get("from") or {}
         uid = int(from_user.get("id") or 0)
@@ -241,6 +310,9 @@ class Bridge:
         if cmd == "/sessions":
             self._send_sessions(chat_id)
             return
+        if cmd == "/projects":
+            self._send_projects(chat_id)
+            return
         if cmd == "/new":
             self._cmd_new(chat_id)
             return
@@ -283,6 +355,24 @@ class Bridge:
             "\n".join(lines),
             reply_markup={"inline_keyboard": keyboard},
         )
+
+    def _send_projects(self, chat_id: int) -> None:
+        from . import projects as projectsmod
+
+        text = projectsmod.index_text(self.workspace)
+        # Keep the Telegram reply short: drop the heading fluff
+        lines = [
+            ln
+            for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#") and not ln.startswith("One line")
+        ]
+        if not lines or lines == ["(no projects yet)"]:
+            self.tg.send_message(chat_id, "No projects yet.")
+            return
+        body = "\n".join(lines[:40])
+        if len(body) > 3500:
+            body = body[:3490] + "…"
+        self.tg.send_message(chat_id, body)
 
     def _set_model(self, name: str) -> None:
         self.engine.model = name
@@ -486,6 +576,23 @@ class Bridge:
         else:
             self.tg.send_html(chat_id, reply)
 
+        # Append-only transcript for nightly project summaries
+        try:
+            sid = result.session_id or self.state.current_session_id or "unknown"
+            eng = getattr(self.engine, "name", None) or (
+                self.cfg.get("ENGINE") or "claude"
+            )
+            append_transcript(
+                self.workspace,
+                engine=str(eng),
+                session_id=sid,
+                user_text=user_text,
+                reply_text=reply or "(empty)",
+                timezone_name=self.cfg.get("TIMEZONE") or "UTC",
+            )
+        except Exception:
+            log.exception("transcript append failed")
+
         # Codex built-in image tool → send new files as photos
         for img in result.images or []:
             try:
@@ -589,7 +696,7 @@ class Bridge:
         if not photos:
             return None
         best = photos[-1]
-        dest = self._inbox() / f"photo_{best['file_id'][:16]}.jpg"
+        dest = self._inbox() / _safe_name(f"photo_{best['file_id'][:16]}.jpg", "photo.jpg")
         try:
             self.tg.download_file(best["file_id"], dest)
             return dest.resolve()
@@ -599,8 +706,14 @@ class Bridge:
 
     def _save_document(self, msg: dict) -> Optional[Path]:
         doc = msg.get("document") or {}
-        name = doc.get("file_name") or f"doc_{doc.get('file_id', 'x')[:16]}"
-        dest = self._inbox() / name
+        fallback = _safe_name(f"doc_{str(doc.get('file_id') or 'x')[:16]}", "document")
+        name = _safe_name(doc.get("file_name") or "", fallback)
+        inbox = self._inbox()
+        tag = str(doc.get("file_unique_id") or doc.get("file_id") or "")
+        dest = _unique_dest(inbox, name, tag)
+        if dest.resolve().parent != inbox.resolve():
+            log.warning("document name %r escapes inbox; using %s", doc.get("file_name"), fallback)
+            dest = _unique_dest(inbox, fallback, tag)
         try:
             self.tg.download_file(doc["file_id"], dest)
             return dest.resolve()
@@ -613,8 +726,8 @@ class Bridge:
         file_id = media.get("file_id")
         if not file_id:
             return None
-        ext = ".ogg" if msg.get("voice") else Path(media.get("file_name") or "audio.ogg").suffix
-        dest = self._inbox() / f"voice_{file_id[:16]}{ext}"
+        ext = ".ogg" if msg.get("voice") else _safe_suffix(media.get("file_name") or "", ".ogg")
+        dest = self._inbox() / _safe_name(f"voice_{file_id[:16]}{ext}", f"voice{ext}")
         try:
             self.tg.download_file(file_id, dest)
         except Exception:

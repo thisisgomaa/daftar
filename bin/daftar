@@ -62,7 +62,7 @@ def _cmd_doctor(_: argparse.Namespace) -> int:
 
 
 def _cmd_send(args: argparse.Namespace) -> int:
-    from daftar.bridge import Bridge
+    from daftar.bridge import CAPTION_SUFFIX, Bridge
     from daftar.config import load_config
 
     cfg = load_config()
@@ -80,7 +80,8 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
         shutil.copy2(path, dest)
     if args.caption:
-        (outbox / (path.name + ".txt")).write_text(args.caption, encoding="utf-8")
+        # Same sidecar name the bridge's outbox delivery reads: "<name>.caption".
+        (outbox / (path.name + CAPTION_SUFFIX)).write_text(args.caption, encoding="utf-8")
     n = bridge.deliver_outbox(once_path=dest)
     print(f"sent {n} file(s)")
     return 0 if n else 1
@@ -114,6 +115,7 @@ def _cmd_kb(args: argparse.Namespace) -> int:
 def _cmd_curator(args: argparse.Namespace) -> int:
     from daftar.config import apply_to_environ, load_config, workspace_path
     from daftar.curator import run_curator
+    from daftar.scheduler import local_now
 
     cfg = load_config()
     apply_to_environ(cfg)
@@ -127,6 +129,7 @@ def _cmd_curator(args: argparse.Namespace) -> int:
         full=args.full,
         topic=args.topic,
         model=cfg.get("CURATOR_MODEL") or "opus",
+        now=local_now(cfg),
     )
 
 
@@ -210,6 +213,121 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_projects(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    from daftar.config import load_config, workspace_path
+    from daftar import projects as projectsmod
+
+    cfg = load_config()
+    ws = workspace_path(cfg)
+    sub = args.projects_cmd
+    if sub == "list":
+        print(projectsmod.index_text(ws))
+        return 0
+    if sub == "show":
+        text = projectsmod.show_project(ws, args.slug)
+        if text is None:
+            print(f"Unknown project: {args.slug}", file=sys.stderr)
+            return 1
+        print(text)
+        return 0
+    if sub == "summarize":
+        date = args.date or datetime.now().strftime("%Y-%m-%d")
+        engine = (cfg.get("ENGINE") or "claude").strip().lower()
+        report = projectsmod.summarize_day(
+            ws,
+            date,
+            preferred_engine=engine,
+            model=cfg.get("SUMMARY_MODEL") or "sonnet",
+            dry_run=args.dry_run,
+        )
+        print(
+            f"date={report['date']} transcripts={report['transcripts']} "
+            f"processed={report['processed']} skipped={report['skipped']} "
+            f"entries={report['entries']}"
+        )
+        if report.get("errors"):
+            print("errors: " + ", ".join(report["errors"]), file=sys.stderr)
+            return 1
+        return 0
+    print("Usage: daftar projects list|show <slug>|summarize [--date D] [--dry-run]")
+    return 2
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    from daftar import backup as backupmod
+    from daftar.config import load_config, workspace_path
+
+    cfg = load_config()
+    sub = args.backup_cmd
+    if sub == "now":
+        report = backupmod.run_backup(cfg)
+        print(report.get("archive") or "")
+        print(report.get("message") or "")
+        return 0 if report.get("verified") else 1
+    if sub == "list":
+        for p in backupmod.list_archives():
+            print(p)
+        return 0
+    if sub == "restore":
+        if not args.archive or not args.to:
+            print("Usage: daftar backup restore <archive> --to <dir> [--force]", file=sys.stderr)
+            return 2
+        try:
+            backupmod.restore_archive(
+                Path(args.archive),
+                Path(args.to),
+                force=args.force,
+                live_workspace=workspace_path(cfg),
+            )
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(f"restored to {args.to}")
+        return 0
+    print("Usage: daftar backup now|list|restore <archive> --to <dir> [--force]")
+    return 2
+
+
+def _cmd_connect(args: argparse.Namespace) -> int:
+    from daftar import connectors as conn
+
+    sub = args.connect_cmd
+    if sub == "list":
+        print("\n".join(conn.list_connectors()))
+        return 0
+    if sub == "add":
+        name = args.name
+        if args.url:
+            headers = []
+            for h in args.header or []:
+                try:
+                    headers.append(conn.parse_header(h))
+                except ValueError as e:
+                    print(str(e), file=sys.stderr)
+                    return 2
+            print("\n\n".join(conn.add_http(name, args.url, headers=headers)))
+            return 0
+        if args.command:
+            envs = []
+            for e in args.env or []:
+                try:
+                    envs.append(conn.parse_env(e))
+                except ValueError as e:
+                    print(str(e), file=sys.stderr)
+                    return 2
+            print("\n\n".join(conn.add_stdio(name, args.command, env=envs)))
+            return 0
+        print("Provide --url or --command", file=sys.stderr)
+        return 2
+    if sub == "remove":
+        print("\n\n".join(conn.remove_connector(args.name)))
+        return 0
+    print("Usage: daftar connect list | add <name> ... | remove <name>")
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="daftar",
@@ -265,6 +383,39 @@ def build_parser() -> argparse.ArgumentParser:
     jp = sub.add_parser("jobs", help="list queued/running/done jobs")
     jp.add_argument("--profile", default=None, help="profile to inspect")
     jp.set_defaults(func=_cmd_jobs)
+
+    pp = sub.add_parser("projects", help="project status pages")
+    pp_sub = pp.add_subparsers(dest="projects_cmd")
+    pp_sub.add_parser("list", help="print projects/INDEX.md")
+    sp = pp_sub.add_parser("show", help="print one STATUS.md")
+    sp.add_argument("slug")
+    sm = pp_sub.add_parser("summarize", help="summarize transcripts for a day")
+    sm.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
+    sm.add_argument("--dry-run", action="store_true")
+    pp.set_defaults(func=_cmd_projects)
+
+    bp = sub.add_parser("backup", help="workspace backups")
+    bp_sub = bp.add_subparsers(dest="backup_cmd")
+    bp_sub.add_parser("now", help="create + verify + prune")
+    bp_sub.add_parser("list", help="list local archives")
+    br = bp_sub.add_parser("restore", help="extract an archive")
+    br.add_argument("archive")
+    br.add_argument("--to", required=True, help="destination directory")
+    br.add_argument("--force", action="store_true")
+    bp.set_defaults(func=_cmd_backup)
+
+    cp = sub.add_parser("connect", help="MCP connectors for Claude / Codex")
+    cp_sub = cp.add_subparsers(dest="connect_cmd")
+    cp_sub.add_parser("list", help="list connectors on installed engines")
+    ca = cp_sub.add_parser("add", help="register a connector")
+    ca.add_argument("name")
+    ca.add_argument("--url", default="", help="HTTP MCP URL")
+    ca.add_argument("--header", action="append", default=[], help='HTTP header "K: V"')
+    ca.add_argument("--command", default="", help="stdio command and args")
+    ca.add_argument("--env", action="append", default=[], help="stdio env KEY=VALUE")
+    cr = cp_sub.add_parser("remove", help="remove a connector")
+    cr.add_argument("name")
+    cp.set_defaults(func=_cmd_connect)
 
     sub.add_parser("version", help="print version").set_defaults(func=_cmd_version)
     return p

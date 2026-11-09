@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -12,10 +13,12 @@ import uuid
 
 
 def main() -> int:
-    # claude -p PROMPT --output-format stream-json --verbose ...
+    # claude -p [PROMPT] --output-format stream-json --verbose ...
+    # Like the real CLI, -p is a flag; without a positional the prompt is read from stdin.
     argv = sys.argv[1:]
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("-p", dest="prompt", default="")
+    parser.add_argument("-p", "--print", dest="print_mode", action="store_true")
+    parser.add_argument("prompt", nargs="?", default=None)
     parser.add_argument("--output-format", default="stream-json")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--model", default="")
@@ -27,12 +30,9 @@ def main() -> int:
     parser.add_argument("--allowed-tools", default="")
     args, _unknown = parser.parse_known_args(argv)
 
-    prompt = args.prompt or ""
-    # Sometimes -p is passed as next positional after flags oddly — keep raw join fallback
-    if not prompt and "-p" in argv:
-        i = argv.index("-p")
-        if i + 1 < len(argv):
-            prompt = argv[i + 1]
+    prompt = args.prompt
+    if prompt is None:
+        prompt = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
 
     sid = args.resume or str(uuid.uuid4())
 
@@ -82,6 +82,9 @@ def main() -> int:
         cache = 0
 
     reply = f"Echo: {prompt[:200]}"
+    if "ECHO_LEN" in prompt:
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+        reply = f"LEN={len(prompt)} SHA={digest}"
     if args.resume:
         reply = f"Resumed({sid[:8]}): {prompt[:180]}"
 

@@ -17,6 +17,7 @@ from .engine import (
     ENGINE_CODEX,
     BaseEngine,
     EngineResult,
+    feed_stdin,
     kill_process_group,
     prepend_repo_bin,
 )
@@ -202,9 +203,11 @@ class CodexEngine(BaseEngine):
         if extra_args:
             flags.extend(extra_args)
 
+        # The prompt goes on stdin ("-"): no argv size limit, and a prompt that
+        # starts with "-" is never parsed as a flag.
         if resume:
             # resume does not accept -C; cwd is set via subprocess
-            cmd = [self.binary, "exec", "resume", resume, full_prompt, *flags]
+            cmd = [self.binary, "exec", "resume", resume, "-", *flags]
         else:
             cmd = [
                 self.binary,
@@ -212,7 +215,7 @@ class CodexEngine(BaseEngine):
                 *flags,
                 "-C",
                 str(self.cwd),
-                full_prompt,
+                "-",
             ]
 
         env = prepend_repo_bin(os.environ.copy())
@@ -225,7 +228,7 @@ class CodexEngine(BaseEngine):
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=str(self.cwd),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -254,6 +257,10 @@ class CodexEngine(BaseEngine):
 
         err_thread = threading.Thread(target=_read_stderr, daemon=True)
         err_thread.start()
+        # Own thread, so a prompt larger than the pipe buffer cannot deadlock.
+        threading.Thread(
+            target=feed_stdin, args=(self._proc, full_prompt), daemon=True
+        ).start()
 
         deadline = time.time() + self.timeout_sec
         assert self._proc.stdout is not None

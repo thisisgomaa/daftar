@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fake `codex` CLI for tests — JSONL events, resume, -o file, images, SLOW."""
+"""Fake `codex` CLI for tests — JSONL events, resume, -o file, images, SLOW.
+
+Prompt: positional argument, or stdin when it is "-" or absent (like the real
+CLI). FAKE_CODEX_PROMPT_OUT=<file> records the exact prompt received.
+"""
 
 from __future__ import annotations
 
@@ -42,9 +46,14 @@ def main() -> int:
     parser.add_argument("-o", "--output-last-message", default="")
     args, unknown = parser.parse_known_args(rest)
 
-    # Prompt is the first non-flag positional remaining
-    prompt_parts = [u for u in unknown if not u.startswith("-")]
-    prompt = prompt_parts[0] if prompt_parts else ""
+    # Prompt is the first positional remaining; "-" (or none) means stdin
+    prompt_parts = [u for u in unknown if u == "-" or not u.startswith("-")]
+    prompt = prompt_parts[0] if prompt_parts else "-"
+    if prompt == "-":
+        prompt = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+    record = os.environ.get("FAKE_CODEX_PROMPT_OUT")
+    if record:
+        Path(record).write_text(prompt, encoding="utf-8")
 
     sid = resume_id or str(uuid.uuid4())
 

@@ -33,6 +33,10 @@ DEFAULTS: dict[str, str] = {
     "ANTHROPIC_API_KEY": "",
     "ASSISTANT_NAME": "",
     "BOT_USERNAME": "",
+    "BACKUP_KEEP": "7",
+    "BACKUP_MAX_FILE_MB": "50",
+    "BACKUP_INCLUDE_CONFIG": "no",
+    "BACKUP_RCLONE_REMOTE": "",
 }
 
 

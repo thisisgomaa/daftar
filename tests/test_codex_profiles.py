@@ -368,6 +368,33 @@ class CodexProfilesTest(unittest.TestCase):
         self.assertEqual(data["status"], "failed")
         self.assertEqual(data["id"], job_id)
 
+    def test_codex_prompt_via_stdin_round_trip(self) -> None:
+        """Prompts reach codex on stdin intact: leading "- " and ~200 KB."""
+        from daftar.engine_codex import CodexEngine
+        from daftar.projects import _run_codex
+
+        record = self.tmp / "prompt.txt"
+        os.environ["FAKE_CODEX_PROMPT_OUT"] = str(record)
+        self.addCleanup(os.environ.pop, "FAKE_CODEX_PROMPT_OUT", None)
+        dash = "- first bullet\n- second bullet --json -o nowhere"
+        big = "- big " + ("x" * 63 + "\n") * 3200  # ~200 KB, > pipe buffer
+        self.assertGreater(len(big), 200_000)
+
+        engine = CodexEngine(cwd=self.ws, binary="codex")
+        res = engine.run(dash)
+        self.assertFalse(res.is_error, msg=res.error)
+        self.assertEqual(record.read_text(encoding="utf-8"), dash)
+        self.assertTrue(res.session_id)
+
+        res2 = engine.run(big, resume=res.session_id)
+        self.assertFalse(res2.is_error, msg=res2.error)
+        self.assertTrue(res2.text.startswith("Resumed("), msg=res2.text[:80])
+        self.assertEqual(record.read_text(encoding="utf-8"), big)
+
+        out = _run_codex(big, model="")
+        self.assertIsNotNone(out)
+        self.assertEqual(record.read_text(encoding="utf-8"), big)
+
 
 if __name__ == "__main__":
     unittest.main()

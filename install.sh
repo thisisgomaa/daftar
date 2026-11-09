@@ -4,11 +4,11 @@ set -eu
 
 need_python() {
   if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 not found. Install Python >= 3.10 first." >&2
+    echo "python3 not found. Install Python >= 3.9 first." >&2
     exit 1
   fi
-  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-    echo "Python >= 3.10 required." >&2
+  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+    echo "Python >= 3.9 required." >&2
     exit 1
   fi
 }

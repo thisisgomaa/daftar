@@ -381,6 +381,154 @@ class BridgeTestCase(unittest.TestCase):
             ]
         self.assertTrue(plains or mid is not None)
 
+    def test_document_name_cannot_escape_inbox(self) -> None:
+        bridge = self._bridge()
+        inbox = (self.ws / "inbox").resolve()
+        settings = self.ws / ".claude" / "settings.json"
+        before = settings.read_bytes() if settings.exists() else None
+
+        def save(name: str, uid: str):
+            msg = {"document": {"file_id": f"FID{uid}", "file_unique_id": uid, "file_name": name}}
+            return bridge._save_document(msg)
+
+        p1 = save("../.claude/settings.json", "uniqA111xyz")
+        p2 = save("/etc/passwd", "uniqB222xyz")
+        p3 = save("..", "uniqC333xyz")
+        for p in (p1, p2, p3):
+            self.assertIsNotNone(p)
+            self.assertEqual(p.parent, inbox, msg=str(p))
+            self.assertFalse(p.name.startswith("."), msg=p.name)
+        self.assertEqual(p1.name, "settings.json")
+        self.assertEqual(p2.name, "passwd")
+        after = settings.read_bytes() if settings.exists() else None
+        self.assertEqual(before, after, "document overwrote workspace .claude/settings.json")
+        # Same name twice -> two distinct files, the first one untouched
+        a = save("report.pdf", "dupAAAAAAAA")
+        (inbox / "report.pdf").write_bytes(b"FIRST")
+        b = save("report.pdf", "dupBBBBBBBB")
+        c = save("report.pdf", "dupBBBBBBBB")
+        self.assertEqual(a.name, "report.pdf")
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(b, c)
+        self.assertEqual(b.name, "report-dupBBBBB.pdf")
+        self.assertEqual((inbox / "report.pdf").read_bytes(), b"FIRST")
+        self.assertTrue(b.exists() and c.exists())
+
+    def test_safe_name_and_suffix(self) -> None:
+        from daftar.bridge import _safe_name, _safe_suffix
+
+        self.assertEqual(_safe_name("a\\..\\b.txt", "fb"), "b.txt")
+        self.assertEqual(_safe_name("x\x00y\n.pdf", "fb"), "x_y_.pdf")
+        self.assertEqual(_safe_name("   ", "fb"), "fb")
+        long = _safe_name("A" * 300 + ".pdf", "fb")
+        self.assertLessEqual(len(long), 120)
+        self.assertTrue(long.endswith(".pdf"))
+        self.assertEqual(_safe_suffix("song.mp3", ".ogg"), ".mp3")
+        self.assertEqual(_safe_suffix("x." + "a" * 20, ".ogg"), ".ogg")
+        self.assertEqual(_safe_suffix("../evil/.sh", ".ogg"), ".ogg")
+        self.assertEqual(_safe_suffix("", ".ogg"), ".ogg")
+
+    def test_cli_send_writes_caption_sidecar(self) -> None:
+        import importlib.machinery
+        import importlib.util
+
+        from daftar.telegram import Telegram
+
+        loader = importlib.machinery.SourceFileLoader("daftar_cli", str(ROOT / "bin" / "daftar"))
+        spec = importlib.util.spec_from_loader("daftar_cli", loader)
+        cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cli)
+
+        src = self.tmp / "report.pdf"
+        src.write_bytes(b"%PDF-1.4 test")
+        outbox = self.ws / "outbox"
+        seen: dict = {}
+        real_send = Telegram.send_document
+
+        def spy(tg_self, chat_id, path, caption=""):
+            seen["caption"] = caption
+            seen["outbox"] = sorted(p.name for p in outbox.iterdir() if p.is_file())
+            return real_send(tg_self, chat_id, path, caption=caption)
+
+        Telegram.send_document = spy
+        try:
+            rc = cli.main(["send", str(src), "hello caption"])
+        finally:
+            Telegram.send_document = real_send
+        self.assertEqual(rc, 0)
+        self.assertIn("report.pdf.caption", seen["outbox"])
+        self.assertNotIn("report.pdf.txt", seen["outbox"])
+        self.assertEqual(seen["caption"], "hello caption")
+        self.assertFalse((outbox / "report.pdf.caption").exists())
+        self.assertFalse((outbox / "report.pdf.txt").exists())
+        self.assertTrue((outbox / "sent" / "report.pdf").exists())
+
+    def test_prompt_goes_through_stdin(self) -> None:
+        import hashlib
+
+        from daftar.engine import ClaudeEngine
+
+        eng = ClaudeEngine(cwd=self.ws, binary="claude", timeout_sec=60)
+        # A prompt that starts with "-" must not be parsed as a CLI option.
+        res = eng.run("- milk\n- eggs")
+        self.assertFalse(res.is_error, msg=res.error)
+        self.assertIn("Echo: - milk", res.text)
+        # 200 KB is above the 128 KiB per-argv-element limit and the pipe buffer.
+        big = "ECHO_LEN " + ("x" * 1023 + "\n") * 200
+        self.assertGreater(len(big.encode()), 200_000)
+        res = eng.run(big)
+        self.assertFalse(res.is_error, msg=res.error)
+        digest = hashlib.sha256(big.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(res.text, f"LEN={len(big)} SHA={digest}")
+        # Non-ASCII survives the pipe.
+        res = eng.run("مرحبا يا دفتر")
+        self.assertIn("مرحبا يا دفتر", res.text)
+
+    def test_curator_prompt_goes_through_stdin(self) -> None:
+        from daftar.curator import ask_model
+
+        prompt = "- Return JSON only\n" + ("lesson line\n" * 20_000)
+        self.assertGreater(len(prompt), 200_000)
+        plan = ask_model(prompt, model="sonnet", binary="claude")
+        self.assertIsInstance(plan, dict)
+        self.assertIn("merge", plan)
+
+    def test_edited_message_is_not_a_new_turn(self) -> None:
+        bridge = self._bridge()
+        # The default long-poll no longer asks Telegram for edits ...
+        seen: dict = {}
+        real_call = bridge.tg.call
+
+        def spy(method, params=None, **kw):
+            if method == "getUpdates":
+                seen.update(params or {})
+            return real_call(method, params, **kw)
+
+        bridge.tg.call = spy
+        bridge.tg.get_updates(None, timeout=1)
+        self.assertNotIn("edited_message", seen.get("allowed_updates") or [])
+        # ... and an edited_message update that still arrives is ignored.
+        with self.tg_state.lock:
+            self.tg_state.sent.clear()
+        upd = {
+            "update_id": 999,
+            "edited_message": {
+                "message_id": 5,
+                "chat": {"id": self.owner_id, "type": "private"},
+                "from": {"id": self.owner_id},
+                "text": "edited hello",
+            },
+        }
+        bridge._dispatch(upd)
+        time.sleep(0.5)
+        self.assertFalse(bridge._running)
+        self.assertIsNone(bridge.state.current_session_id)
+        with self.tg_state.lock:
+            self.assertFalse(
+                any("Echo" in (s.get("text") or "") for s in self.tg_state.sent),
+                msg=str(self.tg_state.sent),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

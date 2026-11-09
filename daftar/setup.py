@@ -265,7 +265,10 @@ def run_setup() -> int:
 
     print("\n(5) Language / timezone / model")
     cfg["LANGUAGE"] = _prompt("Reply language", cfg.get("LANGUAGE") or "English")
-    cfg["TIMEZONE"] = _prompt("Timezone", cfg.get("TIMEZONE") or _detect_timezone())
+    cfg["TIMEZONE"] = _prompt(
+        "Timezone (IANA name; the nightly job runs at 2 AM here by default)",
+        cfg.get("TIMEZONE") or _detect_timezone(),
+    )
     model_hint = "CLI default"
     cfg["MODEL"] = _prompt(
         f"Model (blank = {model_hint})", cfg.get("MODEL") or ""
@@ -351,10 +354,27 @@ def run_setup() -> int:
     ):
         cfg[key] = _prompt(label_key, cfg.get(key, ""), secret=True)
 
+    print("\n(9) Optional backup remote")
+    print("  Nightly backups write tar.gz under DAFTAR_HOME/backups/.")
+    print("  To also upload: install rclone, run `rclone config`, then set a remote")
+    print("  like gdrive:Daftar (folder path after the colon). Leave blank to skip.")
+    cfg["BACKUP_RCLONE_REMOTE"] = _prompt(
+        "BACKUP_RCLONE_REMOTE", cfg.get("BACKUP_RCLONE_REMOTE") or ""
+    )
+    if cfg["BACKUP_RCLONE_REMOTE"] and not shutil.which("rclone"):
+        print("  Note: `rclone` is not on PATH yet — install it before remote uploads work.")
+
+    print("\n(10) Optional connectors (MCP)")
+    print("  Attach HTTP or stdio MCP servers later with:")
+    print('    daftar connect add <name> --url https://example.com/mcp')
+    print('    daftar connect add <name> --command "npx -y some-mcp-server"')
+    print("  See docs/CONNECTORS.md. OAuth connectors may need one interactive")
+    print("  `claude` / `codex` run to authorize.")
+
     save_config(cfg)
     print(f"\n✓ Saved {ensure_home() / 'config.env'} (mode 600)")
 
-    print("\n(9) Service")
+    print("\n(11) Service")
     if _yes("Install background service now?", default=False):
         from . import service as svc
 

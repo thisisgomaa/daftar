@@ -24,9 +24,9 @@ Daftar treats memory like a well-kept notebook:
 | **Topics** | One file per topic (writing, server, images, projects…). Opened only when the work touches that topic. |
 | **Auto-open** | A Claude Code hook (or Codex prompt injection) watches your message and injects the right topic once per session. |
 | **One write path** | `daftar kb add <topic> "one line"` saves a lesson, refuses near-duplicates, and updates the map. |
-| **Nightly curator** | At 2 AM it merges duplicates, retires outdated lines with a reason, and protects the owner's own decisions. Nothing is ever deleted. |
+| **Nightly curator** | Once a night (2 AM in your `TIMEZONE` by default, set by `NIGHTLY_HOUR`) it merges duplicates, retires outdated lines with a reason, and protects the owner's own decisions. Retired lines go to `_archive/`, never deleted. |
 
-Same knowledge, about 70% less to read at the start of every session.
+In the setup Daftar was extracted from, this cut what the assistant reads at session start by about 70%; your numbers will depend on your notes.
 
 ## Run it on Claude Code, Codex, or both
 
@@ -48,11 +48,14 @@ Codex reads `AGENTS.md` (regenerated from rules + persona + MAP). Claude Code ke
 - **Delegation**: hand a job to another bridge; result comes back for delivery
 - **Voice notes**: transcribed with OpenAI, Groq or ElevenLabs, whichever key you have
 - **Interrupt**: send a new message while it works and the running turn is cancelled; pending messages are merged into one turn
-- **No lost messages**: anything sent while the machine was off is processed when it comes back
+- **Offline catch-up**: Telegram holds undelivered messages for about 24 hours, and the bridge resumes from its saved offset, so messages sent while it was down are picked up when it starts, handled like messages sent mid-turn (see Interrupt). Updates are acknowledged as they arrive, so a turn that is running, and messages queued behind it in memory, are lost if the bridge stops mid-turn: resend them.
 - **Long sessions roll over**: when the context grows past a threshold, the assistant writes a handoff paper (goal, decisions, open items, files, next step) and a fresh session continues from it
 - **Chat switching**: `/sessions` lists your last four chats with buttons; `/new` starts fresh with a handoff
 - **Files out**: `daftar send <file>` or drop a file into `workspace/outbox/` (optional caption in `<file>.caption`)
 - **Images**: Codex built-in image tool (auto-delivered) or `daftar image --prompt "…"` (OpenAI Images)
+- **Project summaries**: nightly digest of the day's session transcripts into `projects/<slug>/STATUS.md` + `LOG.md`
+- **Backups**: verified local tar.gz (optional rclone remote); prune only after verify
+- **Connectors**: register MCP servers on Claude Code and/or Codex (`daftar connect`)
 - **Background service**: systemd on Linux, launchd on macOS; Windows through WSL
 - **Python standard library only**: no pip dependencies
 
@@ -78,7 +81,7 @@ Daftar is for people who also want the memory system, voice notes, offline catch
 
 ## Install
 
-**Prerequisites:** Python 3.10+, [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex) installed and signed in, and a Telegram bot token from [@BotFather](https://t.me/BotFather) (one bot per bridge).
+**Prerequisites:** Python 3.9+, [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex) installed and signed in, and a Telegram bot token from [@BotFather](https://t.me/BotFather) (one bot per bridge).
 
 ```bash
 # one-liner
@@ -103,7 +106,7 @@ Send `/ping` to your bot.
 
 ## Commands
 
-**In Telegram:** `/new` · `/sessions` · `/model [sonnet|opus|haiku]` · `/stop` · `/ping` · `/help`
+**In Telegram:** `/new` · `/sessions` · `/projects` · `/model [sonnet|opus|haiku|default]` · `/stop` · `/ping` · `/help`. Any other `/word` is passed to the assistant as text.
 
 **On the machine:**
 
@@ -111,17 +114,23 @@ Send `/ping` to your bot.
 daftar [--profile NAME] setup | run | doctor | version
 daftar profiles
 daftar delegate --to <profile> --title "…" (--brief "…" | --brief-file F) [--attach PATH]...
-daftar jobs [--profile P]
-daftar kb add <topic> "lesson" [--by owner|assistant]
+daftar jobs
+daftar kb add <topic> "lesson" [--by NAME] [--force]
 daftar kb show <topic> | find "words" | topics | check | map
 daftar kb new-topic <slug> "Title" "when to open it"
-daftar curator [--dry-run]
+daftar projects list | show <slug> | summarize [--date YYYY-MM-DD] [--dry-run]
+daftar backup now | list | restore <archive> --to <dir> [--force]
+daftar connect list
+daftar connect add <name> --url URL [--header "K: V"]...
+daftar connect add <name> --command "cmd args" [--env KEY=VALUE]...
+daftar connect remove <name>
+daftar curator [--dry-run] [--full] [--topic SLUG]
 daftar send <file> [caption]
-daftar image --prompt "…" --out file.png [--ref image]
-daftar service install | uninstall | status
+daftar image --prompt "…" --out file.png [--ref image]... [--size 1024x1024]
+daftar service [install | uninstall | status]
 ```
 
-`--profile NAME` (or env `DAFTAR_PROFILE`) puts config/state/logs in `DAFTAR_HOME/profiles/NAME/`. No flag keeps the existing default home.
+`--profile NAME` (or env `DAFTAR_PROFILE`) works with every command and puts config/state/logs in `DAFTAR_HOME/profiles/NAME/`. No flag keeps the existing default home. `kb add --by owner` marks a line the curator must never merge or retire.
 
 ## Workspace layout
 
@@ -136,16 +145,36 @@ daftar-workspace/
   knowledge/core.md      the few rules that are never optional
   knowledge/topics/*.md  one file per topic
   knowledge/_archive/    everything the curator retired, with reasons
+  projects/              INDEX.md + <slug>/{STATUS,LOG}.md (nightly summaries)
   sessions/              handoff papers
+  sessions/transcripts/  append-only turn logs (source for summaries)
   delegations/           cross-bridge job workspaces
   inbox/  outbox/        files in and out of Telegram
 ```
 
 ## Security
 
-- Only the paired Telegram account can talk to the bot; everyone else is ignored.
-- `bypassPermissions` lets the assistant run commands and edit files without asking. Use it only on a machine dedicated to the assistant. Claude Code refuses it as root unless `IS_SANDBOX=1` is set; a normal user account is the better choice. On Codex this maps to `--dangerously-bypass-approvals-and-sandbox`.
-- Keys live in `~/.daftar/config.env` (or a profile's `config.env`) with mode 600 and are never written to the workspace.
+Daftar gives a chat account control of a machine. Know what that means:
+
+- **A message is a shell.** Only the paired Telegram account is answered, but whoever controls it directs an agent running as the service user. With `bypassPermissions` (the default; Codex: `--dangerously-bypass-approvals-and-sandbox`) that agent runs any command without asking. Protect the Telegram account (two-step verification).
+- **The assistant can read anything that user can**, including `~/.daftar/config.env` with the bot token and keys.
+- **Keys reach the engine.** API keys from `config.env` are exported to the environment of the `claude` / `codex` child process and the commands it runs.
+- **Forwarded content is untrusted.** Files, photos, pasted text and pages the assistant reads can carry prompt injection that steers it into running commands.
+- **Root means root.** `daftar service install` run as root writes a system unit that runs as root. Use a dedicated, unprivileged user (Claude Code also refuses `bypassPermissions` as root unless `IS_SANDBOX=1`).
+- On a shared machine use `acceptEdits` or `default` (Codex: `-s workspace-write`).
+- `config.env` (or a profile's) is mode 600, never written to the workspace, and left out of backups unless `BACKUP_INCLUDE_CONFIG=yes`.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+## Tests
+
+From the repo root (no network, accounts, or real `claude` / `codex` needed; the tests use fakes):
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Do not add `-I`: isolated mode drops the repo root from `sys.path` and the `daftar` imports fail.
 
 ## Roadmap
 
@@ -154,4 +183,6 @@ daftar-workspace/
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+Daftar is not affiliated with or endorsed by Anthropic or OpenAI.
